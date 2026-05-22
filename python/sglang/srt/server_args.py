@@ -3196,6 +3196,7 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "structured-hint",
             ],
             help="The scheduling policy of the requests.",
         )
@@ -5219,7 +5220,8 @@ class ServerArgs:
             assert self.schedule_policy in [
                 "fcfs",
                 "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+                "structured-hint",
+            ], f"To use priority scheduling, schedule_policy must be 'fcfs', 'lof', or 'structured-hint'. '{self.schedule_policy}' is not supported."
 
         # Check multi-item scoring
         if self.multi_item_scoring_delimiter is not None:

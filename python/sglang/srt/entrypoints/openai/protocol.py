@@ -297,6 +297,11 @@ class CompletionRequest(BaseModel):
     # Priority for the request
     priority: Optional[int] = None
 
+    # Advisory SGLang scheduling/cache locality hints. Invalid values are ignored
+    # later by the internal StructuredRequestHints parser.
+    sglang_hints: Optional[Any] = None
+    metadata: Optional[Dict[str, Any]] = None
+
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
@@ -608,6 +613,11 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+
+    # Advisory SGLang scheduling/cache locality hints. Invalid values are ignored
+    # later by the internal StructuredRequestHints parser.
+    sglang_hints: Optional[Any] = None
+    metadata: Optional[Dict[str, Any]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None

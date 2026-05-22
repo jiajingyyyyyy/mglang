@@ -24,7 +24,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_routed_experts_from_ret,
     to_openai_style_logprobs,
 )
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import GenerateReqInput, StructuredRequestHints
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
@@ -118,6 +118,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
+            structured_hints=StructuredRequestHints.from_raw(
+                request.sglang_hints, request.metadata
+            ),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
         )

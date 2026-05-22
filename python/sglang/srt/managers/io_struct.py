@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import uuid
 from abc import ABC
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
@@ -141,6 +142,74 @@ _API_SERVING_TIMING_MIXIN_FIELDS = tuple(
 )
 
 
+@dataclass(frozen=True)
+class StructuredRequestHints:
+    """Best-effort locality and scheduling hints carried with a generation request.
+
+    These hints are advisory only. They must not affect request correctness or the
+    radix cache namespace; schedulers may use them to improve admission locality.
+    """
+
+    prefix_key: Optional[str] = None
+    decode_class: Optional[str] = None
+    grammar_id: Optional[str] = None
+    max_tokens_bucket: Optional[str] = None
+    priority_class: Optional[str] = None
+    cache_affinity_key: Optional[str] = None
+    deadline_ms: Optional[float] = None
+    next_prefix_key: Optional[str] = None
+    next_stage_prob: Optional[float] = None
+    expected_tool_latency_ms: Optional[float] = None
+    cache_pin_ttl_ms: Optional[float] = None
+
+    @classmethod
+    def from_raw(
+        cls,
+        hints: Optional[Union["StructuredRequestHints", Mapping[str, Any]]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> Optional["StructuredRequestHints"]:
+        if isinstance(hints, StructuredRequestHints):
+            return hints
+        raw = hints
+        if raw is None and isinstance(metadata, Mapping):
+            raw = metadata.get("sglang_hints")
+        if not isinstance(raw, Mapping):
+            return None
+
+        string_fields = (
+            "prefix_key",
+            "decode_class",
+            "grammar_id",
+            "max_tokens_bucket",
+            "priority_class",
+            "cache_affinity_key",
+            "next_prefix_key",
+        )
+        number_fields = (
+            "deadline_ms",
+            "next_stage_prob",
+            "expected_tool_latency_ms",
+            "cache_pin_ttl_ms",
+        )
+        values: Dict[str, Any] = {}
+        for field_name in string_fields:
+            value = raw.get(field_name)
+            if isinstance(value, str) and value:
+                values[field_name] = value
+        for field_name in number_fields:
+            value = raw.get(field_name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                values[field_name] = float(value)
+        return cls(**values) if values else None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            field_name: value
+            for field_name, value in self.__dict__.items()
+            if value is not None
+        }
+
+
 # Parameters for a session
 @dataclass
 class SessionParams:
@@ -253,6 +322,15 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
+
+    # Advisory locality and scheduling hints for structured agent workloads.
+    structured_hints: Optional[
+        Union[
+            StructuredRequestHints,
+            Mapping[str, Any],
+            List[Optional[Union[StructuredRequestHints, Mapping[str, Any]]]],
+        ]
+    ] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -389,6 +467,9 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             self.top_logprobs_num = 0
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
+        self.structured_hints = StructuredRequestHints.from_raw(
+            self.structured_hints
+        )
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -410,6 +491,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_structured_hints(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -612,6 +694,20 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
+    def _normalize_structured_hints(self, num):
+        """Normalize structured hints for batch processing."""
+        if self.structured_hints is None:
+            self.structured_hints = [None] * num
+        elif isinstance(self.structured_hints, list):
+            normalized = [
+                StructuredRequestHints.from_raw(item)
+                for item in self.structured_hints
+            ]
+            self.structured_hints = normalized * self.parallel_sample_num
+        else:
+            hint = StructuredRequestHints.from_raw(self.structured_hints)
+            self.structured_hints = [hint] * num
+
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
         if self.session_params is not None:
@@ -678,6 +774,11 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
+            structured_hints=(
+                self.structured_hints[i]
+                if isinstance(self.structured_hints, list)
+                else self.structured_hints
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -755,6 +856,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
+
+    # Advisory locality and scheduling hints for structured agent workloads.
+    structured_hints: Optional[StructuredRequestHints] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False

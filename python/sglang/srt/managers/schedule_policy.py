@@ -88,6 +88,7 @@ class CacheAgnosticPolicy(Enum):
     LOF = "lof"  # longest output first
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
+    STRUCTURED_HINT = "structured-hint"  # locality-aware advisory request hints
 
 
 class SchedulePolicy:
@@ -151,6 +152,13 @@ class SchedulePolicy:
             elif policy == CacheAgnosticPolicy.ROUTING_KEY:
                 if running_batch is not None:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
+            elif policy == CacheAgnosticPolicy.STRUCTURED_HINT:
+                SchedulePolicy._sort_by_structured_hints(
+                    waiting_queue,
+                    running_batch,
+                    self.enable_priority_scheduling,
+                    self.priority_sign,
+                )
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
         return prefix_computed
@@ -340,6 +348,93 @@ class SchedulePolicy:
         if _ROUTING_KEY_POLICY_DEBUG_LOG:
             waiting_keys_after = [r.routing_key for r in waiting_queue]
             logger.info(f"waiting_keys_after={waiting_keys_after}")
+
+    @staticmethod
+    def _sort_by_structured_hints(
+        waiting_queue: List[Req],
+        running_batch: Optional[ScheduleBatch],
+        enable_priority_scheduling: bool,
+        priority_sign: int,
+    ) -> None:
+        """Sort requests by advisory structured hints while preserving FCFS fallback."""
+        if len(waiting_queue) <= 1:
+            return
+
+        running_hints = [
+            getattr(req, "structured_hints", None)
+            for req in (running_batch.reqs if running_batch is not None else [])
+            if getattr(req, "structured_hints", None) is not None
+        ]
+        if running_hints:
+            anchors = running_hints
+        else:
+            first_hint = next(
+                (
+                    getattr(req, "structured_hints", None)
+                    for req in waiting_queue
+                    if getattr(req, "structured_hints", None) is not None
+                ),
+                None,
+            )
+            anchors = [first_hint] if first_hint is not None else []
+
+        if not anchors and not enable_priority_scheduling:
+            return
+
+        indexed_reqs = list(enumerate(waiting_queue))
+
+        def hint_value(hint, field_name: str):
+            return getattr(hint, field_name, None) if hint is not None else None
+
+        def same_non_empty(candidate, anchor, field_name: str) -> bool:
+            candidate_value = hint_value(candidate, field_name)
+            return bool(
+                candidate_value and candidate_value == hint_value(anchor, field_name)
+            )
+
+        def locality_tier(req: Req) -> int:
+            hint = getattr(req, "structured_hints", None)
+            if hint is None or not anchors:
+                return 5
+            best = 5
+            for anchor in anchors:
+                if same_non_empty(hint, anchor, "prefix_key"):
+                    best = min(best, 0)
+                elif same_non_empty(hint, anchor, "cache_affinity_key"):
+                    best = min(best, 1)
+                elif same_non_empty(hint, anchor, "decode_class") or same_non_empty(
+                    hint, anchor, "grammar_id"
+                ):
+                    best = min(best, 2)
+                elif same_non_empty(hint, anchor, "max_tokens_bucket"):
+                    best = min(best, 3)
+                elif same_non_empty(hint, anchor, "priority_class"):
+                    best = min(best, 4)
+            return best
+
+        def arrival_time(req: Req):
+            return getattr(getattr(req, "time_stats", None), "wait_queue_entry_time", 0)
+
+        def deadline(req: Req):
+            hint = getattr(req, "structured_hints", None)
+            value = getattr(hint, "deadline_ms", None) if hint is not None else None
+            return value if value is not None else float("inf")
+
+        def priority(req: Req):
+            if not enable_priority_scheduling:
+                return 0
+            return (getattr(req, "priority", 0) or 0) * priority_sign
+
+        indexed_reqs.sort(
+            key=lambda item: (
+                locality_tier(item[1]),
+                priority(item[1]),
+                deadline(item[1]),
+                arrival_time(item[1]),
+                item[0],
+            )
+        )
+        waiting_queue[:] = [req for _index, req in indexed_reqs]
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
