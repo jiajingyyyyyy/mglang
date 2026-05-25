@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.utils import get_bool_env_var
@@ -11,6 +12,19 @@ STRUCTURED_HINT_GROUP_CAP = int(os.environ.get("SGLANG_STRUCTURED_HINT_GROUP_CAP
 STRUCTURED_HINT_POLICY_DEBUG_LOG = get_bool_env_var(
     "SGLANG_STRUCTURED_HINT_POLICY_DEBUG_LOG"
 )
+SLO_PREFIX_DEFAULT_BUDGET_MS = float(
+    os.environ.get("SGLANG_SLO_PREFIX_DEFAULT_BUDGET_MS", "10000")
+)
+SLO_PREFIX_REACT_BUDGET_MS = float(
+    os.environ.get("SGLANG_SLO_PREFIX_REACT_BUDGET_MS", str(SLO_PREFIX_DEFAULT_BUDGET_MS))
+)
+SLO_PREFIX_MOTIF_BUDGET_MS = float(
+    os.environ.get("SGLANG_SLO_PREFIX_MOTIF_BUDGET_MS", str(SLO_PREFIX_DEFAULT_BUDGET_MS))
+)
+SLO_PREFIX_EPS_MS = float(os.environ.get("SGLANG_SLO_PREFIX_EPS_MS", "50"))
+SLO_PREFIX_SLACK_GAMMA = float(os.environ.get("SGLANG_SLO_PREFIX_SLACK_GAMMA", "1.0"))
+SLO_PREFIX_MIX_DFS_SLOTS = int(os.environ.get("SGLANG_SLO_PREFIX_MIX_DFS_SLOTS", "3"))
+SLO_PREFIX_MIX_SLO_SLOTS = int(os.environ.get("SGLANG_SLO_PREFIX_MIX_SLO_SLOTS", "1"))
 logger = logging.getLogger(__name__)
 
 # Copyright 2023-2024 SGLang Team
@@ -83,12 +97,15 @@ class CacheAwarePolicy(Enum):
 
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+    SLO_PREFIX_DFS = "slo-prefix-dfs"  # prefix reuse weighted by SLO slack
+    SLO_PREFIX_MIXED_DFS = "slo-prefix-mixed-dfs"  # bounded SLO slice over DFS
 
 
 class CacheAgnosticPolicy(Enum):
     """Scheduling policies that are not aware of the tree cache."""
 
     FCFS = "fcfs"  # first come first serve
+    EDF_LIKE = "edf-like"  # earliest remaining SLO slack first
     LOF = "lof"  # longest output first
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
@@ -115,6 +132,7 @@ class SchedulePolicy:
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
+        self.slo_prefix_mixed_slo_order_rids = []
 
     def calc_priority(
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
@@ -140,11 +158,19 @@ class SchedulePolicy:
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
+            elif policy == CacheAwarePolicy.SLO_PREFIX_DFS:
+                SchedulePolicy._sort_by_slo_prefix_dfs(
+                    waiting_queue, self.tree_cache
+                )
+            elif policy == CacheAwarePolicy.SLO_PREFIX_MIXED_DFS:
+                self._sort_by_slo_prefix_mixed_dfs(waiting_queue, self.tree_cache)
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
             if policy == CacheAgnosticPolicy.FCFS:
                 pass
+            elif policy == CacheAgnosticPolicy.EDF_LIKE:
+                SchedulePolicy._sort_by_edf_like(waiting_queue)
             elif policy == CacheAgnosticPolicy.LOF:
                 SchedulePolicy._sort_by_longest_output(
                     waiting_queue,
@@ -287,6 +313,72 @@ class SchedulePolicy:
         )
 
     @staticmethod
+    def _sort_by_slo_prefix_dfs(
+        waiting_queue: List[Req], tree_cache: BasePrefixCache
+    ) -> None:
+        """Sort by prefix reuse per aggregate remaining SLO slack.
+
+        This is a small semantic/SLO-aware overlay on top of radix DFS. Cache
+        identity is unchanged: requests still match by real token prefix. The
+        scheduler only changes which radix subtree is explored first:
+
+            score(subtree) = shared_prefix_len * waiting_count / sum(slack)^gamma
+
+        where slack is derived from request wait time and an agent-class budget.
+        """
+        now = time.perf_counter()
+        last_node_to_reqs = defaultdict(list)
+        node_to_slack_sum = defaultdict(float)
+        for req in waiting_queue:
+            last_node_to_reqs[req.last_node].append(req)
+            node_to_slack_sum[req.last_node] += SchedulePolicy._slo_prefix_slack_s(
+                req, now
+            )
+
+        node_to_weight = defaultdict(int)
+        node_to_score = defaultdict(float)
+        for node, reqs in last_node_to_reqs.items():
+            node_to_weight[node] = len(reqs)
+
+        SchedulePolicy._calc_slo_prefix_score(
+            tree_cache.root_node,
+            depth=0,
+            node_to_weight=node_to_weight,
+            node_to_slack_sum=node_to_slack_sum,
+            node_to_score=node_to_score,
+        )
+
+        waiting_queue.clear()
+        SchedulePolicy._get_slo_prefix_dfs_priority(
+            tree_cache.root_node,
+            node_to_score,
+            node_to_weight,
+            last_node_to_reqs,
+            waiting_queue,
+            now,
+        )
+
+    @staticmethod
+    def _slo_prefix_slack_s(req: Req, now: float) -> float:
+        hint = getattr(req, "structured_hints", None)
+        agent_type = str(
+            getattr(hint, "agent_type", None)
+            or getattr(hint, "trace_label", None)
+            or ""
+        ).lower()
+        if agent_type == "motif":
+            budget_ms = SLO_PREFIX_MOTIF_BUDGET_MS
+        elif agent_type == "react":
+            budget_ms = SLO_PREFIX_REACT_BUDGET_MS
+        else:
+            budget_ms = SLO_PREFIX_DEFAULT_BUDGET_MS
+
+        wait_entry = getattr(getattr(req, "time_stats", None), "wait_queue_entry_time", 0)
+        wait_s = max(0.0, now - wait_entry) if wait_entry else 0.0
+        eps_s = max(0.001, SLO_PREFIX_EPS_MS / 1000.0)
+        return max(eps_s, budget_ms / 1000.0 - wait_s)
+
+    @staticmethod
     def _sort_by_longest_output(
         waiting_queue: List[Req],
         enable_priority_scheduling: bool,
@@ -317,6 +409,23 @@ class SchedulePolicy:
             key=lambda x: (
                 x.priority * priority_sign,
                 x.time_stats.wait_queue_entry_time,
+            )
+        )
+
+    @staticmethod
+    def _sort_by_edf_like(waiting_queue: List[Req]) -> None:
+        """Sort by remaining SLO slack without using prefix locality.
+
+        This is an intentionally simple deadline baseline for experiments. It
+        shares the same React/Motif budget interpretation as slo-prefix-dfs but
+        does not look at radix subtrees, so any locality difference comes from
+        the policy rather than cache identity changes.
+        """
+        now = time.perf_counter()
+        waiting_queue.sort(
+            key=lambda req: (
+                SchedulePolicy._slo_prefix_slack_s(req, now),
+                getattr(getattr(req, "time_stats", None), "wait_queue_entry_time", 0),
             )
         )
 
@@ -545,6 +654,36 @@ class SchedulePolicy:
             node_to_weight[cur_node] += node_to_weight[child]
 
     @staticmethod
+    def _calc_slo_prefix_score(
+        cur_node: TreeNode,
+        depth: int,
+        node_to_weight: Dict[TreeNode, int],
+        node_to_slack_sum: Dict[TreeNode, float],
+        node_to_score: Dict[TreeNode, float],
+    ) -> None:
+        for child in cur_node.children.values():
+            child_depth = depth + len(child.key or [])
+            SchedulePolicy._calc_slo_prefix_score(
+                child,
+                child_depth,
+                node_to_weight,
+                node_to_slack_sum,
+                node_to_score,
+            )
+            node_to_weight[cur_node] += node_to_weight[child]
+            node_to_slack_sum[cur_node] += node_to_slack_sum[child]
+
+        weight = node_to_weight[cur_node]
+        if weight <= 0:
+            node_to_score[cur_node] = 0.0
+            return
+        slack_sum = max(SLO_PREFIX_EPS_MS / 1000.0, node_to_slack_sum[cur_node])
+        slack_gamma = max(0.0, SLO_PREFIX_SLACK_GAMMA)
+        node_to_score[cur_node] = (max(0, depth) * weight) / (
+            slack_sum**slack_gamma
+        )
+
+    @staticmethod
     def _get_dfs_priority(
         cur_node: TreeNode,
         node_to_priority: Dict[TreeNode, int],
@@ -558,6 +697,109 @@ class SchedulePolicy:
                 child, node_to_priority, last_node_to_reqs, q
             )
         q.extend(last_node_to_reqs[cur_node])
+
+    @staticmethod
+    def _get_slo_prefix_dfs_priority(
+        cur_node: TreeNode,
+        node_to_score: Dict[TreeNode, float],
+        node_to_weight: Dict[TreeNode, int],
+        last_node_to_reqs: Dict[TreeNode, List[Req]],
+        q: List,
+        now: float,
+    ) -> None:
+        children = [child for child in cur_node.children.values()]
+        children.sort(
+            key=lambda x: (
+                -node_to_score[x],
+                -node_to_weight[x],
+            )
+        )
+        for child in children:
+            SchedulePolicy._get_slo_prefix_dfs_priority(
+                child,
+                node_to_score,
+                node_to_weight,
+                last_node_to_reqs,
+                q,
+                now,
+            )
+        reqs = last_node_to_reqs[cur_node]
+        reqs.sort(key=lambda req: SchedulePolicy._slo_prefix_slack_s(req, now))
+        q.extend(reqs)
+
+    def _sort_by_slo_prefix_mixed_dfs(
+        self, waiting_queue: List[Req], tree_cache: BasePrefixCache
+    ) -> None:
+        """Keep DFS as the main lane and cache a bounded SLO-prefix slice order.
+
+        The scheduler uses the cached SLO-prefix order at prefill batch
+        construction time, so the split applies to the current serving batch
+        instead of globally interleaving the entire waiting queue.
+        """
+        self.slo_prefix_mixed_slo_order_rids = []
+        if len(waiting_queue) <= 1:
+            return
+
+        dfs_order = list(waiting_queue)
+        slo_order = list(waiting_queue)
+        SchedulePolicy._sort_by_dfs_weight(dfs_order, tree_cache)
+        SchedulePolicy._sort_by_slo_prefix_dfs(slo_order, tree_cache)
+        self.slo_prefix_mixed_slo_order_rids = [req.rid for req in slo_order]
+        waiting_queue[:] = dfs_order
+
+    def build_slo_prefix_mixed_batch_order(
+        self, waiting_queue: List[Req]
+    ) -> Optional[List[Req]]:
+        """Return a per-batch DFS/SLO candidate order for mixed scheduling."""
+
+        policy_value = getattr(getattr(self, "policy", None), "value", None)
+        if policy_value != "slo-prefix-mixed-dfs" or len(waiting_queue) <= 1:
+            return None
+
+        dfs_slots = max(1, SLO_PREFIX_MIX_DFS_SLOTS)
+        slo_slots = max(0, SLO_PREFIX_MIX_SLO_SLOTS)
+        if slo_slots <= 0 or not self.slo_prefix_mixed_slo_order_rids:
+            return None
+
+        rid_to_req = {req.rid: req for req in waiting_queue}
+        slo_order = [
+            rid_to_req[rid]
+            for rid in self.slo_prefix_mixed_slo_order_rids
+            if rid in rid_to_req
+        ]
+        pattern = ["dfs"] * dfs_slots + ["slo"] * slo_slots
+        selected = set()
+        mixed_order: List[Req] = []
+        dfs_idx = 0
+        slo_idx = 0
+
+        def take_from(order: List[Req], start: int) -> tuple[Optional[Req], int]:
+            idx = start
+            while idx < len(order):
+                req = order[idx]
+                idx += 1
+                if req.rid not in selected:
+                    return req, idx
+            return None, idx
+
+        while len(mixed_order) < len(waiting_queue):
+            for lane in pattern:
+                if len(mixed_order) >= len(waiting_queue):
+                    break
+                if lane == "slo":
+                    req, slo_idx = take_from(slo_order, slo_idx)
+                    if req is None:
+                        req, dfs_idx = take_from(waiting_queue, dfs_idx)
+                else:
+                    req, dfs_idx = take_from(waiting_queue, dfs_idx)
+                    if req is None:
+                        req, slo_idx = take_from(slo_order, slo_idx)
+                if req is None:
+                    continue
+                selected.add(req.rid)
+                mixed_order.append(req)
+
+        return mixed_order
 
 
 class AddReqResult(Enum):
