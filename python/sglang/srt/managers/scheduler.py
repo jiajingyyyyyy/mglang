@@ -1988,6 +1988,43 @@ class Scheduler(
                 counts[str(prefix_key)] += 1
         return dict(counts) if counts else None
 
+    @staticmethod
+    def _schedule_trace_len(value) -> int:
+        """Return a trace-safe length for list-like values and tensors."""
+
+        if value is None:
+            return 0
+        numel = getattr(value, "numel", None)
+        if callable(numel):
+            try:
+                return int(numel())
+            except (TypeError, ValueError, RuntimeError):
+                return 0
+        try:
+            return len(value)
+        except (TypeError, ValueError, RuntimeError):
+            return 0
+
+    @staticmethod
+    def _schedule_trace_int(value, default: int = 0) -> int:
+        """Return a trace-safe int for scalars that may be tensors."""
+
+        if value is None:
+            return default
+        numel = getattr(value, "numel", None)
+        item = getattr(value, "item", None)
+        if callable(numel) and callable(item):
+            try:
+                if int(numel()) == 0:
+                    return default
+                value = item()
+            except (TypeError, ValueError, RuntimeError):
+                return default
+        try:
+            return int(value)
+        except (TypeError, ValueError, RuntimeError):
+            return default
+
     def _write_schedule_trace(self, *, event: str, reqs: List[Req]) -> None:
         """Write per-request scheduler decisions for cache/locality experiments."""
 
@@ -2025,14 +2062,28 @@ class Scheduler(
                 "stage_id": getattr(hint, "stage_id", None),
                 "prefix_key": getattr(hint, "prefix_key", None),
                 "prompt_prefix_hash": getattr(hint, "prompt_prefix_hash", None),
-                "input_len": len(getattr(req, "origin_input_ids", []) or []),
-                "output_len": len(getattr(req, "output_ids", []) or []),
-                "fill_len": len(getattr(req, "fill_ids", []) or []),
-                "prefix_len": len(getattr(req, "prefix_indices", []) or []),
-                "host_hit_length": int(getattr(req, "host_hit_length", 0) or 0),
-                "storage_hit_length": int(getattr(req, "storage_hit_length", 0) or 0),
-                "extend_input_len": int(getattr(req, "extend_input_len", 0) or 0),
-                "cached_tokens": int(getattr(req, "cached_tokens", 0) or 0),
+                "input_len": self._schedule_trace_len(
+                    getattr(req, "origin_input_ids", None)
+                ),
+                "output_len": self._schedule_trace_len(
+                    getattr(req, "output_ids", None)
+                ),
+                "fill_len": self._schedule_trace_len(getattr(req, "fill_ids", None)),
+                "prefix_len": self._schedule_trace_len(
+                    getattr(req, "prefix_indices", None)
+                ),
+                "host_hit_length": self._schedule_trace_int(
+                    getattr(req, "host_hit_length", 0)
+                ),
+                "storage_hit_length": self._schedule_trace_int(
+                    getattr(req, "storage_hit_length", 0)
+                ),
+                "extend_input_len": self._schedule_trace_int(
+                    getattr(req, "extend_input_len", 0)
+                ),
+                "cached_tokens": self._schedule_trace_int(
+                    getattr(req, "cached_tokens", 0)
+                ),
                 "cache_priority": float(getattr(req, "cache_priority", 0.0) or 0.0),
                 "cache_pin_alive": bool(expires_at and expires_at > now_perf),
                 "queue_wait_s": max(0.0, now_perf - wait_entry) if wait_entry else None,
@@ -2041,7 +2092,7 @@ class Scheduler(
                     or 0
                 ),
                 "is_retracted": bool(getattr(req, "is_retracted", False)),
-                "extra_key_present": bool(getattr(req, "extra_key", None)),
+                "extra_key_present": getattr(req, "extra_key", None) is not None,
             }
             rows.append(row)
 
