@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
+STRUCTURED_HINT_GROUP_CAP = int(os.environ.get("SGLANG_STRUCTURED_HINT_GROUP_CAP", "4"))
+STRUCTURED_HINT_POLICY_DEBUG_LOG = get_bool_env_var(
+    "SGLANG_STRUCTURED_HINT_POLICY_DEBUG_LOG"
+)
 logger = logging.getLogger(__name__)
 
 # Copyright 2023-2024 SGLang Team
@@ -23,7 +28,6 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 """Request scheduler policy"""
 
-import os
 import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
@@ -356,7 +360,14 @@ class SchedulePolicy:
         enable_priority_scheduling: bool,
         priority_sign: int,
     ) -> None:
-        """Sort requests by advisory structured hints while preserving FCFS fallback."""
+        """Sort requests by advisory structured hints with balanced group fill.
+
+        The initial structured-hint policy anchored on one running/waiting hint
+        and moved all matching requests to the front. That maximizes locality for
+        one prefix, but it can also starve other prefixes. Here we group requests
+        by their strongest locality hint, emit a capped FIFO run from each group,
+        and round-robin across groups.
+        """
         if len(waiting_queue) <= 1:
             return
 
@@ -382,6 +393,10 @@ class SchedulePolicy:
             return
 
         indexed_reqs = list(enumerate(waiting_queue))
+        has_structured_hints = any(
+            getattr(req, "structured_hints", None) is not None
+            for _index, req in indexed_reqs
+        )
 
         def hint_value(hint, field_name: str):
             return getattr(hint, field_name, None) if hint is not None else None
@@ -392,7 +407,7 @@ class SchedulePolicy:
                 candidate_value and candidate_value == hint_value(anchor, field_name)
             )
 
-        def locality_tier(req: Req) -> int:
+        def locality_tier_to_anchors(req: Req) -> int:
             hint = getattr(req, "structured_hints", None)
             if hint is None or not anchors:
                 return 5
@@ -412,6 +427,30 @@ class SchedulePolicy:
                     best = min(best, 4)
             return best
 
+        def group_key(req: Req, original_index: int):
+            hint = getattr(req, "structured_hints", None)
+            if hint is None:
+                # Keep no-hint requests FCFS-compatible. Grouping all no-hint
+                # requests together would accidentally create a new policy.
+                return ("no_hint", original_index)
+            prefix_key = hint_value(hint, "prefix_key")
+            if prefix_key:
+                return ("prefix", prefix_key)
+            cache_affinity_key = hint_value(hint, "cache_affinity_key")
+            if cache_affinity_key:
+                return ("cache", cache_affinity_key)
+            grammar_id = hint_value(hint, "grammar_id")
+            decode_class = hint_value(hint, "decode_class")
+            if grammar_id or decode_class:
+                return ("decode", grammar_id or "", decode_class or "")
+            max_tokens_bucket = hint_value(hint, "max_tokens_bucket")
+            if max_tokens_bucket:
+                return ("max_tokens", max_tokens_bucket)
+            priority_class = hint_value(hint, "priority_class")
+            if priority_class:
+                return ("priority", priority_class)
+            return ("hint", original_index)
+
         def arrival_time(req: Req):
             return getattr(getattr(req, "time_stats", None), "wait_queue_entry_time", 0)
 
@@ -425,16 +464,79 @@ class SchedulePolicy:
                 return 0
             return (getattr(req, "priority", 0) or 0) * priority_sign
 
-        indexed_reqs.sort(
-            key=lambda item: (
-                locality_tier(item[1]),
-                priority(item[1]),
-                deadline(item[1]),
-                arrival_time(item[1]),
-                item[0],
+        if not has_structured_hints:
+            indexed_reqs.sort(
+                key=lambda item: (
+                    priority(item[1]),
+                    deadline(item[1]),
+                    arrival_time(item[1]),
+                    item[0],
+                )
             )
+            waiting_queue[:] = [req for _index, req in indexed_reqs]
+            return
+
+        grouped_reqs = defaultdict(list)
+        group_meta = {}
+        for original_index, req in indexed_reqs:
+            key = group_key(req, original_index)
+            grouped_reqs[key].append((original_index, req))
+            meta = group_meta.setdefault(
+                key,
+                {
+                    "best_tier": locality_tier_to_anchors(req),
+                    "first_arrival": arrival_time(req),
+                    "first_index": original_index,
+                },
+            )
+            meta["best_tier"] = min(meta["best_tier"], locality_tier_to_anchors(req))
+            meta["first_arrival"] = min(meta["first_arrival"], arrival_time(req))
+            meta["first_index"] = min(meta["first_index"], original_index)
+
+        for items in grouped_reqs.values():
+            items.sort(
+                key=lambda item: (
+                    priority(item[1]),
+                    deadline(item[1]),
+                    arrival_time(item[1]),
+                    item[0],
+                )
+            )
+
+        group_order = sorted(
+            grouped_reqs,
+            key=lambda key: (
+                group_meta[key]["best_tier"],
+                group_meta[key]["first_arrival"],
+                group_meta[key]["first_index"],
+            ),
         )
-        waiting_queue[:] = [req for _index, req in indexed_reqs]
+
+        cap = max(1, STRUCTURED_HINT_GROUP_CAP)
+        emitted: List[Req] = []
+        while group_order:
+            next_group_order = []
+            for key in group_order:
+                items = grouped_reqs[key]
+                for _ in range(min(cap, len(items))):
+                    emitted.append(items.pop(0)[1])
+                if items:
+                    next_group_order.append(key)
+            group_order = next_group_order
+
+        if STRUCTURED_HINT_POLICY_DEBUG_LOG:
+            prefix_counts = Counter()
+            for req in emitted:
+                hint = getattr(req, "structured_hints", None)
+                prefix_counts[hint_value(hint, "prefix_key") or "<none>"] += 1
+            logger.info(
+                "structured_hint_balanced_order cap=%s prefix_counts=%s order=%s",
+                cap,
+                dict(prefix_counts),
+                [req.rid for req in emitted],
+            )
+
+        waiting_queue[:] = emitted
 
     @staticmethod
     def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:

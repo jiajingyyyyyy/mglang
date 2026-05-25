@@ -609,6 +609,25 @@ class Req(ReqDllmMixin):
         self.lora_id = lora_id
         self.routing_key = routing_key
         self.structured_hints = structured_hints
+        self.cache_priority = self._cache_priority_from_structured_hints(structured_hints)
+        self.cache_pin_expires_at = self._cache_pin_expires_at_from_structured_hints(
+            structured_hints
+        )
+        self.cache_hint_prefix_key = (
+            getattr(structured_hints, "prefix_key", None) if structured_hints else None
+        )
+        self.cache_hint_motif_id = (
+            getattr(structured_hints, "motif_id", None) if structured_hints else None
+        )
+        self.cache_hint_stage_id = (
+            getattr(structured_hints, "stage_id", None) if structured_hints else None
+        )
+        self.cache_hint_agent_type = (
+            getattr(structured_hints, "agent_type", None) if structured_hints else None
+        )
+        self.cache_hint_trace_label = (
+            getattr(structured_hints, "trace_label", None) if structured_hints else None
+        )
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -814,6 +833,31 @@ class Req(ReqDllmMixin):
 
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
+
+    @staticmethod
+    def _cache_priority_from_structured_hints(structured_hints) -> float:
+        if structured_hints is None:
+            return 0.0
+        value = getattr(structured_hints, "priority", None)
+        if value is None:
+            return 0.0
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _cache_pin_expires_at_from_structured_hints(structured_hints) -> Optional[float]:
+        if structured_hints is None:
+            return None
+        ttl_ms = getattr(structured_hints, "cache_pin_ttl_ms", None)
+        if ttl_ms is None:
+            return None
+        try:
+            ttl_s = max(0.0, float(ttl_ms) / 1000.0)
+        except (TypeError, ValueError):
+            return None
+        return time.monotonic() + ttl_s
 
     @property
     def seqlen(self) -> int:

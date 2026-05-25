@@ -161,6 +161,17 @@ class StructuredRequestHints:
     next_stage_prob: Optional[float] = None
     expected_tool_latency_ms: Optional[float] = None
     cache_pin_ttl_ms: Optional[float] = None
+    motif_id: Optional[str] = None
+    stage_id: Optional[str] = None
+    static_prefix_len: Optional[float] = None
+    saved_prefill_cost_ms: Optional[float] = None
+    kv_blocks: Optional[float] = None
+    priority: Optional[float] = None
+    agent_type: Optional[str] = None
+    trace_label: Optional[str] = None
+    trace_id: Optional[str] = None
+    task_id: Optional[str] = None
+    prompt_prefix_hash: Optional[str] = None
 
     @classmethod
     def from_raw(
@@ -184,12 +195,23 @@ class StructuredRequestHints:
             "priority_class",
             "cache_affinity_key",
             "next_prefix_key",
+            "motif_id",
+            "stage_id",
+            "agent_type",
+            "trace_label",
+            "trace_id",
+            "task_id",
+            "prompt_prefix_hash",
         )
         number_fields = (
             "deadline_ms",
             "next_stage_prob",
             "expected_tool_latency_ms",
             "cache_pin_ttl_ms",
+            "static_prefix_len",
+            "saved_prefill_cost_ms",
+            "kv_blocks",
+            "priority",
         )
         values: Dict[str, Any] = {}
         for field_name in string_fields:

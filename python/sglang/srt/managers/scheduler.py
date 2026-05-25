@@ -14,12 +14,13 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import json
 import logging
 import os
 import signal
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -1975,6 +1976,86 @@ class Scheduler(
 
         return ret
 
+    @staticmethod
+    def _structured_hint_prefix_counts(reqs: List[Req]) -> Optional[dict[str, int]]:
+        """Return prefix-key composition for structured-hint prefill logging."""
+
+        counts = Counter()
+        for req in reqs:
+            hint = getattr(req, "structured_hints", None)
+            prefix_key = getattr(hint, "prefix_key", None) if hint is not None else None
+            if prefix_key:
+                counts[str(prefix_key)] += 1
+        return dict(counts) if counts else None
+
+    def _write_schedule_trace(self, *, event: str, reqs: List[Req]) -> None:
+        """Write per-request scheduler decisions for cache/locality experiments."""
+
+        trace_path = os.environ.get("SGLANG_SCHEDULE_TRACE_FILE", "").strip()
+        trace_to_log = os.environ.get("SGLANG_SCHEDULE_TRACE_LOG", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not trace_path and not trace_to_log:
+            return
+
+        now_perf = time.perf_counter()
+        policy = getattr(getattr(self.policy, "policy", None), "value", None)
+        if policy is None:
+            policy = str(getattr(self.policy, "policy", "unknown"))
+
+        rows = []
+        for rank, req in enumerate(reqs):
+            hint = getattr(req, "structured_hints", None)
+            wait_entry = getattr(req.time_stats, "wait_queue_entry_time", 0) or 0
+            expires_at = getattr(req, "cache_pin_expires_at", None)
+            row = {
+                "ts": time.time(),
+                "event": event,
+                "policy": policy,
+                "rank": rank,
+                "rid": str(getattr(req, "rid", "")),
+                "agent_type": getattr(hint, "agent_type", None),
+                "trace_label": getattr(hint, "trace_label", None),
+                "trace_id": getattr(hint, "trace_id", None),
+                "task_id": getattr(hint, "task_id", None),
+                "motif_id": getattr(hint, "motif_id", None),
+                "stage_id": getattr(hint, "stage_id", None),
+                "prefix_key": getattr(hint, "prefix_key", None),
+                "prompt_prefix_hash": getattr(hint, "prompt_prefix_hash", None),
+                "input_len": len(getattr(req, "origin_input_ids", []) or []),
+                "output_len": len(getattr(req, "output_ids", []) or []),
+                "fill_len": len(getattr(req, "fill_ids", []) or []),
+                "prefix_len": len(getattr(req, "prefix_indices", []) or []),
+                "host_hit_length": int(getattr(req, "host_hit_length", 0) or 0),
+                "storage_hit_length": int(getattr(req, "storage_hit_length", 0) or 0),
+                "extend_input_len": int(getattr(req, "extend_input_len", 0) or 0),
+                "cached_tokens": int(getattr(req, "cached_tokens", 0) or 0),
+                "cache_priority": float(getattr(req, "cache_priority", 0.0) or 0.0),
+                "cache_pin_alive": bool(expires_at and expires_at > now_perf),
+                "queue_wait_s": max(0.0, now_perf - wait_entry) if wait_entry else None,
+                "max_new_tokens": int(
+                    getattr(getattr(req, "sampling_params", None), "max_new_tokens", 0)
+                    or 0
+                ),
+                "is_retracted": bool(getattr(req, "is_retracted", False)),
+                "extra_key_present": bool(getattr(req, "extra_key", None)),
+            }
+            rows.append(row)
+
+        if trace_to_log:
+            for row in rows:
+                logger.info("SGLANG_SCHEDULE_TRACE %s", json.dumps(row, sort_keys=True))
+        if trace_path:
+            try:
+                with open(trace_path, "a", encoding="utf-8") as f:
+                    for row in rows:
+                        f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            except OSError as exc:
+                logger.warning("Failed to write SGLang schedule trace: %s", exc)
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2179,7 +2260,11 @@ class Scheduler(
             new_token_ratio=adder.new_token_ratio,
             running_bs=len(self.running_batch.reqs),
             num_new_seqs=len(can_run_list),
+            structured_hint_prefix_counts=self._structured_hint_prefix_counts(
+                can_run_list
+            ),
         )
+        self._write_schedule_trace(event="prefill_admit", reqs=can_run_list)
 
         # Mixed-style chunked prefill
         if (
@@ -2660,6 +2745,8 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        if hasattr(self.tree_cache, "priority_eviction_stats"):
+            ret["priority_eviction_stats"] = self.tree_cache.priority_eviction_stats()
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (

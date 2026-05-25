@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import StructuredRequestHints
 from sglang.srt.managers.schedule_policy import SchedulePolicy
@@ -50,6 +51,30 @@ class TestStructuredHintScheduling(unittest.TestCase):
         self.assertCountEqual(
             [req.rid for req in waiting_queue],
             ["a0", "b0", "c0", "a1", "b1", "c1"],
+        )
+
+    def test_hot_prefix_is_capped_and_balanced_with_other_prefixes(self):
+        waiting_queue = [
+            _req("a0", "A", 0),
+            _req("b0", "B", 1),
+            _req("a1", "A", 2),
+            _req("b1", "B", 3),
+            _req("a2", "A", 4),
+            _req("b2", "B", 5),
+            _req("a3", "A", 6),
+            _req("b3", "B", 7),
+            _req("a4", "A", 8),
+            _req("b4", "B", 9),
+        ]
+
+        with patch("sglang.srt.managers.schedule_policy.STRUCTURED_HINT_GROUP_CAP", 2):
+            self._policy().calc_priority(
+                waiting_queue, running_batch=SimpleNamespace(reqs=[])
+            )
+
+        self.assertEqual(
+            [req.rid for req in waiting_queue],
+            ["a0", "a1", "b0", "b1", "a2", "a3", "b2", "b3", "a4", "b4"],
         )
 
     def test_without_hints_structured_hint_policy_is_fcfs(self):

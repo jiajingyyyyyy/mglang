@@ -59,7 +59,9 @@ class InsertParams:
 
     # General
     chunked: bool = False
-    priority: int = 0
+    priority: float = 0.0
+    cache_pin_expires_at: Optional[float] = None
+    cache_hint_prefix_key: Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -227,3 +229,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+    def priority_eviction_stats(self) -> dict[str, float]:
+        return {}

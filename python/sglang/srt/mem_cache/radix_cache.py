@@ -98,7 +98,7 @@ class TreeNode:
 
     counter = 0
 
-    def __init__(self, id: Optional[int] = None, priority: int = 0):
+    def __init__(self, id: Optional[int] = None, priority: float = 0.0):
         self.children = defaultdict(TreeNode)
         self.parent: TreeNode = None
         self.key: RadixKey = None
@@ -116,7 +116,10 @@ class TreeNode:
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
-        self.priority = priority
+        self.priority = float(priority or 0.0)
+        self.cache_pin_expires_at: Optional[float] = None
+        self.cache_hint_prefix_key: Optional[str] = None
+        self.cache_hit_after_pin = 0
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -128,6 +131,13 @@ class TreeNode:
     @property
     def backuped(self):
         return self.host_value is not None
+
+    def effective_priority(self, now: Optional[float] = None) -> float:
+        if self.cache_pin_expires_at is not None:
+            now = time.monotonic() if now is None else now
+            if now > self.cache_pin_expires_at:
+                return 0.0
+        return max(0.0, float(self.priority or 0.0))
 
     def protect_host(self):
         """Protect the host value from eviction."""
@@ -336,6 +346,12 @@ class RadixCache(BasePrefixCache):
         self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self.priority_protected_blocks = 0
+        self.priority_expired_blocks = 0
+        self.priority_evicted_blocks = 0
+        self.protected_but_not_reused_blocks = 0
+        self.evicted_hot_prefix_count = 0
+        self.reuse_after_pin_count = 0
         self.evictable_leaves.clear()
         self._record_all_cleared_event()
 
@@ -411,6 +427,9 @@ class RadixCache(BasePrefixCache):
             return empty_match_result()
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
+        if last_node is not self.root_node and last_node.effective_priority() > 0:
+            last_node.cache_hit_after_pin += 1
+            self.reuse_after_pin_count += 1
         if value:
             value = torch.cat(value)
         else:
@@ -434,7 +453,14 @@ class RadixCache(BasePrefixCache):
 
         key, value = self.maybe_bigram_convert(key, value)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority)
+        prefix_len = self._insert_helper(
+            self.root_node,
+            key,
+            value,
+            priority,
+            params.cache_pin_expires_at,
+            params.cache_hint_prefix_key,
+        )
         return InsertResult(prefix_len=prefix_len)
 
     def _page_align_keys(self, key: list) -> list:
@@ -470,9 +496,15 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
-            priority = getattr(req, "priority", 0) or 0
+            priority = getattr(req, "cache_priority", 0.0) or 0.0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    priority=priority,
+                    cache_pin_expires_at=getattr(req, "cache_pin_expires_at", None),
+                    cache_hint_prefix_key=getattr(req, "cache_hint_prefix_key", None),
+                )
             )
             new_prefix_len = result.prefix_len
             # Free the duplicates that were already in the tree
@@ -512,7 +544,9 @@ class RadixCache(BasePrefixCache):
                 key=radix_key,
                 value=values,
                 chunked=chunked,
-                priority=getattr(req, "priority", 0) or 0,
+                priority=getattr(req, "cache_priority", 0.0) or 0.0,
+                cache_pin_expires_at=getattr(req, "cache_pin_expires_at", None),
+                cache_hint_prefix_key=getattr(req, "cache_hint_prefix_key", None),
             )
         )
         new_prefix_len = result.prefix_len
@@ -577,6 +611,14 @@ class RadixCache(BasePrefixCache):
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
+            if x.priority > 0:
+                if x.effective_priority() <= 0:
+                    self.priority_expired_blocks += len(x.value)
+                else:
+                    self.priority_evicted_blocks += len(x.value)
+                    self.evicted_hot_prefix_count += 1
+                if x.cache_hit_after_pin <= 0:
+                    self.protected_but_not_reused_blocks += len(x.value)
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
@@ -632,6 +674,32 @@ class RadixCache(BasePrefixCache):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
 
+    def priority_eviction_stats(self) -> dict[str, float]:
+        total_protected = float(self.priority_protected_blocks or 0)
+        return {
+            "protected_but_not_reused_blocks": float(self.protected_but_not_reused_blocks),
+            "evicted_hot_prefix_count": float(self.evicted_hot_prefix_count),
+            "reuse_after_pin_rate": (
+                float(self.reuse_after_pin_count) / total_protected
+                if total_protected > 0.0
+                else 0.0
+            ),
+            "reuse_after_pin_count": float(self.reuse_after_pin_count),
+            "priority_protected_blocks": total_protected,
+            "priority_expired_blocks": float(self.priority_expired_blocks),
+            "priority_evicted_blocks": float(self.priority_evicted_blocks),
+        }
+
+    def available_and_evictable_str(self) -> str:
+        base = super().available_and_evictable_str()
+        stats = self.priority_eviction_stats()
+        return (
+            base
+            + "Priority eviction stats: "
+            + ", ".join(f"{key}={value}" for key, value in stats.items())
+            + "\n"
+        )
+
     def all_values_flatten(self):
         values = []
 
@@ -675,6 +743,8 @@ class RadixCache(BasePrefixCache):
         # new_node -> child
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
+        new_node.cache_pin_expires_at = child.cache_pin_expires_at
+        new_node.cache_hint_prefix_key = child.cache_hint_prefix_key
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -692,14 +762,40 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: RadixKey, value, priority: int = 0):
+    def _apply_priority_hint(
+        self,
+        node: TreeNode,
+        priority: float,
+        cache_pin_expires_at: Optional[float],
+        cache_hint_prefix_key: Optional[str],
+    ):
+        priority = max(0.0, float(priority or 0.0))
+        if priority <= 0.0:
+            return
+        existing_active = node.effective_priority() > 0.0
+        if not existing_active or priority >= node.effective_priority():
+            if node.effective_priority() <= 0.0:
+                self.priority_protected_blocks += 0 if node.value is None else len(node.value)
+            node.priority = priority
+            node.cache_pin_expires_at = cache_pin_expires_at
+            node.cache_hint_prefix_key = cache_hint_prefix_key
+
+    def _insert_helper(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        priority: float = 0.0,
+        cache_pin_expires_at: Optional[float] = None,
+        cache_hint_prefix_key: Optional[str] = None,
+    ):
         # Convert None priority to 0
         if priority is None:
-            priority = 0
+            priority = 0.0
         access_time = time.monotonic()
         node.last_access_time = access_time
-        # Update priority along the path (take max to propagate higher priority)
-        node.priority = max(node.priority, priority)
+        # Update priority along the path so shared ancestors are protected too.
+        self._apply_priority_hint(node, priority, cache_pin_expires_at, cache_hint_prefix_key)
         if len(key) == 0:
             return 0
 
@@ -716,16 +812,22 @@ class RadixCache(BasePrefixCache):
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
-                new_node.priority = max(new_node.priority, priority)
+                self._apply_priority_hint(
+                    new_node, priority, cache_pin_expires_at, cache_hint_prefix_key
+                )
                 node = new_node
             else:
-                node.priority = max(node.priority, priority)
+                self._apply_priority_hint(
+                    node, priority, cache_pin_expires_at, cache_hint_prefix_key
+                )
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
             new_node = TreeNode(priority=priority)
+            new_node.cache_pin_expires_at = cache_pin_expires_at
+            new_node.cache_hint_prefix_key = cache_hint_prefix_key
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()

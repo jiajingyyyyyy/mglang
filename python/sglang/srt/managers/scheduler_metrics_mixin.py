@@ -52,6 +52,7 @@ class PrefillStats:
     new_token_ratio: float
     running_bs: int
     num_new_seqs: int  # len(can_run_list)
+    structured_hint_prefix_counts: Optional[dict[str, int]] = None
 
 
 class KvMetrics:
@@ -219,6 +220,22 @@ class SchedulerMetricsMixin:
             f"#running-req: {prefill_stats.running_bs}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
+        if prefill_stats.structured_hint_prefix_counts:
+            prefix_counts = prefill_stats.structured_hint_prefix_counts
+            largest_prefix_count = max(prefix_counts.values())
+            prefix_purity = (
+                largest_prefix_count / prefill_stats.num_new_seqs
+                if prefill_stats.num_new_seqs > 0
+                else 0.0
+            )
+            top_prefixes = sorted(
+                prefix_counts.items(), key=lambda item: (-item[1], item[0])
+            )[:4]
+            msg += (
+                f"structured-prefix-groups: {len(prefix_counts)}, "
+                f"structured-prefix-purity: {prefix_purity:.3f}, "
+                f"structured-prefix-top: {top_prefixes}, "
+            )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "

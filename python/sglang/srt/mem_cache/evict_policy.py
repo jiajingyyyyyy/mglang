@@ -39,8 +39,7 @@ class FILOStrategy(EvictionStrategy):
 
 
 class PriorityStrategy(EvictionStrategy):
-    """Priority-aware eviction: lower priority values evicted first, then LRU within same priority."""
+    """Priority-aware eviction: lower benefit-per-block values evicted first."""
 
-    def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
-        # Return (priority, last_access_time) so lower priority nodes are evicted first
-        return (node.priority, node.last_access_time)
+    def get_priority(self, node: "TreeNode") -> Tuple[float, float]:
+        return (node.effective_priority(), node.last_access_time)
