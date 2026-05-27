@@ -172,6 +172,8 @@ class StructuredRequestHints:
     trace_id: Optional[str] = None
     task_id: Optional[str] = None
     prompt_prefix_hash: Optional[str] = None
+    prefix_ladder: Optional[List[Dict[str, Any]]] = None
+    latest_start_ms: Optional[float] = None
 
     @classmethod
     def from_raw(
@@ -205,6 +207,8 @@ class StructuredRequestHints:
         )
         number_fields = (
             "deadline_ms",
+            "latest_start_ms",
+            "latest_start_us",
             "next_stage_prob",
             "expected_tool_latency_ms",
             "cache_pin_ttl_ms",
@@ -221,7 +225,34 @@ class StructuredRequestHints:
         for field_name in number_fields:
             value = raw.get(field_name)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
-                values[field_name] = float(value)
+                if field_name == "latest_start_us":
+                    values["latest_start_ms"] = float(value) / 1000.0
+                else:
+                    values[field_name] = float(value)
+        prefix_ladder = raw.get("prefix_ladder")
+        if isinstance(prefix_ladder, list):
+            clean_ladder: List[Dict[str, Any]] = []
+            for raw_entry in prefix_ladder:
+                if not isinstance(raw_entry, Mapping):
+                    continue
+                prefix_hash = raw_entry.get("prefix_hash") or raw_entry.get("hash")
+                prefix_len = raw_entry.get("prefix_len") or raw_entry.get("len")
+                if not isinstance(prefix_hash, str) or not prefix_hash:
+                    continue
+                if not isinstance(prefix_len, (int, float)) or isinstance(
+                    prefix_len, bool
+                ):
+                    continue
+                clean_ladder.append(
+                    {
+                        "level": str(raw_entry.get("level") or "prefix"),
+                        "prefix_hash": prefix_hash,
+                        "prefix_len": int(prefix_len),
+                        "exact": bool(raw_entry.get("exact", True)),
+                    }
+                )
+            if clean_ladder:
+                values["prefix_ladder"] = clean_ladder
         return cls(**values) if values else None
 
     def to_dict(self) -> Dict[str, Any]:

@@ -2078,6 +2078,15 @@ class Scheduler(
                 "storage_hit_length": self._schedule_trace_int(
                     getattr(req, "storage_hit_length", 0)
                 ),
+                "load_back_tokens": self._schedule_trace_int(
+                    getattr(req, "load_back_tokens", 0)
+                ),
+                "load_back_submit_wall_ms": float(
+                    getattr(req, "load_back_submit_wall_ms", 0.0) or 0.0
+                ),
+                "load_back_submitted": bool(
+                    getattr(req, "load_back_submitted", False)
+                ),
                 "extend_input_len": self._schedule_trace_int(
                     getattr(req, "extend_input_len", 0)
                 ),
@@ -2798,6 +2807,8 @@ class Scheduler(
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
         if hasattr(self.tree_cache, "priority_eviction_stats"):
             ret["priority_eviction_stats"] = self.tree_cache.priority_eviction_stats()
+        if hasattr(self.policy, "get_mpls_stats"):
+            ret["mpls_stats"] = self.policy.get_mpls_stats()
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (

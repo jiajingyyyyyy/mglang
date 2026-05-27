@@ -14,6 +14,8 @@ limitations under the License.
 """
 
 import logging
+import json
+import os
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -46,6 +48,24 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+HICACHE_WAIT_TRACE_FILE = os.environ.get("SGLANG_HICACHE_WAIT_TRACE_FILE")
+HICACHE_WAIT_SYNC_TRACE = os.environ.get("SGLANG_HICACHE_WAIT_SYNC_TRACE", "0") == "1"
+HICACHE_WAIT_TRACE_MIN_MS = float(
+    os.environ.get("SGLANG_HICACHE_WAIT_TRACE_MIN_MS", "0.0")
+)
+_hicache_wait_trace_lock = threading.Lock()
+
+
+def _write_hicache_wait_trace(row: dict):
+    if not HICACHE_WAIT_TRACE_FILE:
+        return
+    try:
+        with _hicache_wait_trace_lock:
+            with open(HICACHE_WAIT_TRACE_FILE, "a") as fout:
+                fout.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except Exception:
+        logger.debug("Failed to write HiCache wait trace", exc_info=True)
 
 
 class LayerLoadingEvent:
@@ -90,7 +110,20 @@ class LayerDoneCounter:
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
+        start = time.perf_counter()
         self.events[self.consumer_index].wait(threshold)
+        if HICACHE_WAIT_SYNC_TRACE:
+            self.events[self.consumer_index].load_events[threshold].synchronize()
+            wait_ms = (time.perf_counter() - start) * 1000.0
+            if wait_ms >= HICACHE_WAIT_TRACE_MIN_MS:
+                _write_hicache_wait_trace(
+                    {
+                        "ts": time.time(),
+                        "consumer_index": self.consumer_index,
+                        "layer": int(threshold),
+                        "wait_sync_ms": wait_ms,
+                    }
+                )
 
     def reset(self):
         self.producer_index = -1

@@ -685,6 +685,11 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # HiCache host->device load-back telemetry. This measures the scheduler-side
+        # submit overhead; the H2D copy itself can continue asynchronously.
+        self.load_back_tokens = 0
+        self.load_back_submit_wall_ms = 0.0
+        self.load_back_submitted = False
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache

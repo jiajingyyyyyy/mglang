@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 
@@ -23,8 +24,43 @@ SLO_PREFIX_MOTIF_BUDGET_MS = float(
 )
 SLO_PREFIX_EPS_MS = float(os.environ.get("SGLANG_SLO_PREFIX_EPS_MS", "50"))
 SLO_PREFIX_SLACK_GAMMA = float(os.environ.get("SGLANG_SLO_PREFIX_SLACK_GAMMA", "1.0"))
+SLO_PREFIX_MARGINAL_COST_GAMMA = float(
+    os.environ.get("SGLANG_SLO_PREFIX_MARGINAL_COST_GAMMA", "0.25")
+)
+SLO_BOOST_REACT_ALPHA = float(os.environ.get("SGLANG_SLO_BOOST_REACT_ALPHA", "1.0"))
+SLO_BOOST_MOTIF_BETA = float(os.environ.get("SGLANG_SLO_BOOST_MOTIF_BETA", "2.0"))
+SLO_BOOST_REACT_TARGET_MS = float(
+    os.environ.get("SGLANG_SLO_BOOST_REACT_TARGET_MS", "30000")
+)
+SLO_BOOST_MOTIF_LAG_TARGET_MS = float(
+    os.environ.get("SGLANG_SLO_BOOST_MOTIF_LAG_TARGET_MS", "10000")
+)
+SLO_BOOST_MAX_MULTIPLIER = float(
+    os.environ.get("SGLANG_SLO_BOOST_MAX_MULTIPLIER", "4.0")
+)
 SLO_PREFIX_MIX_DFS_SLOTS = int(os.environ.get("SGLANG_SLO_PREFIX_MIX_DFS_SLOTS", "3"))
 SLO_PREFIX_MIX_SLO_SLOTS = int(os.environ.get("SGLANG_SLO_PREFIX_MIX_SLO_SLOTS", "1"))
+SLO_COST_PREFIX_DECODE_WEIGHT = float(
+    os.environ.get("SGLANG_SLO_COST_PREFIX_DECODE_WEIGHT", "0.0")
+)
+SLO_COST_PREFIX_REACT_TAU_S = float(
+    os.environ.get("SGLANG_SLO_COST_PREFIX_REACT_TAU_S", "5.0")
+)
+SLO_COST_PREFIX_MOTIF_TAU_S = float(
+    os.environ.get("SGLANG_SLO_COST_PREFIX_MOTIF_TAU_S", "10.0")
+)
+SLO_COST_PREFIX_SEMANTIC_WEIGHT = float(
+    os.environ.get("SGLANG_SLO_COST_PREFIX_SEMANTIC_WEIGHT", "1.0")
+)
+SLO_COST_PREFIX_MIN_REUSE_VALUE = float(
+    os.environ.get("SGLANG_SLO_COST_PREFIX_MIN_REUSE_VALUE", "1.0")
+)
+SLO_COST_PREFIX_SEMANTIC_GROUP = os.environ.get(
+    "SGLANG_SLO_COST_PREFIX_SEMANTIC_GROUP", "stage"
+).strip().lower()
+MPLS_TOP_K = int(os.environ.get("SGLANG_MPLS_TOP_K", "32"))
+MPLS_MAX_LADDER_LEVELS = int(os.environ.get("SGLANG_MPLS_MAX_LADDER_LEVELS", "6"))
+MPLS_DEFAULT_BUDGET_MS = float(os.environ.get("SGLANG_MPLS_DEFAULT_BUDGET_MS", "10000"))
 logger = logging.getLogger(__name__)
 
 # Copyright 2023-2024 SGLang Team
@@ -97,8 +133,13 @@ class CacheAwarePolicy(Enum):
 
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+    SLO_BOOSTED_DFS = "slo-boosted-dfs"  # DFS weighted by online React/Motif SLO boost
     SLO_PREFIX_DFS = "slo-prefix-dfs"  # prefix reuse weighted by SLO slack
+    SLO_MARGINAL_PREFIX_DFS = "slo-marginal-prefix-dfs"  # SLO-prefix DFS with weak marginal prefill cost
+    SLO_COST_PREFIX_DFS = "slo-cost-prefix-dfs"  # prefix reuse weighted by SLO urgency/cost
+    SEMANTIC_SLO_COST_DFS = "semantic-slo-cost-dfs"  # motif semantic overlay over SLO/cost prefix DFS
     SLO_PREFIX_MIXED_DFS = "slo-prefix-mixed-dfs"  # bounded SLO slice over DFS
+    MPLS = "mpls"  # deadline-guarded motif prefix lease scheduling
 
 
 class CacheAgnosticPolicy(Enum):
@@ -133,6 +174,7 @@ class SchedulePolicy:
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
         self.slo_prefix_mixed_slo_order_rids = []
+        self.mpls_stats = defaultdict(float)
 
     def calc_priority(
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
@@ -158,12 +200,34 @@ class SchedulePolicy:
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
+            elif policy == CacheAwarePolicy.SLO_BOOSTED_DFS:
+                SchedulePolicy._sort_by_slo_boosted_dfs(
+                    waiting_queue, self.tree_cache
+                )
             elif policy == CacheAwarePolicy.SLO_PREFIX_DFS:
                 SchedulePolicy._sort_by_slo_prefix_dfs(
                     waiting_queue, self.tree_cache
                 )
+            elif policy == CacheAwarePolicy.SLO_MARGINAL_PREFIX_DFS:
+                SchedulePolicy._sort_by_slo_marginal_prefix_dfs(
+                    waiting_queue, self.tree_cache
+                )
+            elif policy == CacheAwarePolicy.SLO_COST_PREFIX_DFS:
+                SchedulePolicy._sort_by_slo_cost_prefix_dfs(
+                    waiting_queue, self.tree_cache, semantic_overlay=False
+                )
+            elif policy == CacheAwarePolicy.SEMANTIC_SLO_COST_DFS:
+                SchedulePolicy._sort_by_slo_cost_prefix_dfs(
+                    waiting_queue, self.tree_cache, semantic_overlay=True
+                )
             elif policy == CacheAwarePolicy.SLO_PREFIX_MIXED_DFS:
                 self._sort_by_slo_prefix_mixed_dfs(waiting_queue, self.tree_cache)
+            elif policy == CacheAwarePolicy.MPLS:
+                SchedulePolicy._sort_by_mpls(
+                    waiting_queue,
+                    temporary_deprioritized,
+                    self.mpls_stats,
+                )
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -291,6 +355,261 @@ class SchedulePolicy:
         )
 
     @staticmethod
+    def _sort_by_mpls(
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        mpls_stats: Optional[Dict[str, float]] = None,
+    ) -> None:
+        """Sort by deadline-guarded prefix leases without external waiting.
+
+        MPLS is intentionally work-conserving here: it only reorders the
+        backend-visible waiting queue.  The selected lease is moved to the
+        front, and the normal SGLang prefill adder may continue filling the
+        batch from following requests if capacity remains.
+        """
+        if len(waiting_queue) <= 1:
+            return
+
+        now = time.perf_counter()
+        if mpls_stats is not None:
+            mpls_stats["calls"] += 1
+            mpls_stats["waiting_req_count_total"] += len(waiting_queue)
+        leases: Dict[tuple, dict] = {}
+        for original_index, req in enumerate(waiting_queue):
+            for entry in SchedulePolicy._mpls_prefix_ladder(req):
+                key = SchedulePolicy._mpls_lease_key(req, entry)
+                lease = leases.setdefault(
+                    key,
+                    {
+                        "key": key,
+                        "level": entry["level"],
+                        "prefix_hash": entry["prefix_hash"],
+                        "prefix_len": entry["prefix_len"],
+                        "reqs": [],
+                        "first_arrival": float("inf"),
+                        "deadline": float("inf"),
+                    },
+                )
+                lease["reqs"].append((original_index, req))
+                arrival = SchedulePolicy._mpls_arrival_s(req)
+                lease["first_arrival"] = min(lease["first_arrival"], arrival)
+                lease["deadline"] = min(
+                    lease["deadline"], SchedulePolicy._mpls_deadline_s(req, now)
+                )
+
+        if not leases:
+            if mpls_stats is not None:
+                mpls_stats["fallback_longest_prefix_count"] += 1
+            SchedulePolicy._sort_by_longest_prefix(
+                waiting_queue, temporary_deprioritized
+            )
+            return
+
+        scored_leases = []
+        for lease in leases.values():
+            req_count = len(lease["reqs"])
+            if req_count <= 0:
+                continue
+            denominator = max(1e-3, lease["deadline"] - lease["first_arrival"])
+            normalized_lag = (now - lease["first_arrival"]) / denominator
+            prefix_gain = max(0, req_count - 1) * max(0, int(lease["prefix_len"]))
+            lease["normalized_lag"] = normalized_lag
+            lease["prefix_gain"] = prefix_gain
+            scored_leases.append(lease)
+
+        if not scored_leases:
+            if mpls_stats is not None:
+                mpls_stats["fallback_longest_prefix_count"] += 1
+            SchedulePolicy._sort_by_longest_prefix(
+                waiting_queue, temporary_deprioritized
+            )
+            return
+
+        expired = [lease for lease in scored_leases if lease["deadline"] <= now]
+        if mpls_stats is not None:
+            mpls_stats["active_lease_count_total"] += len(scored_leases)
+            mpls_stats["expired_lease_count_total"] += len(expired)
+        if expired:
+            selected = min(
+                expired,
+                key=lambda lease: (
+                    lease["deadline"],
+                    lease["first_arrival"],
+                    -lease["prefix_gain"],
+                ),
+            )
+            selected_expired = True
+        else:
+            candidates = sorted(
+                scored_leases,
+                key=lambda lease: (
+                    lease["normalized_lag"],
+                    lease["prefix_gain"],
+                    lease["prefix_len"],
+                ),
+                reverse=True,
+            )[: max(1, MPLS_TOP_K)]
+            selected = max(
+                candidates,
+                key=lambda lease: (
+                    lease["prefix_gain"],
+                    lease["normalized_lag"],
+                    lease["prefix_len"],
+                ),
+            )
+            selected_expired = False
+            if selected["prefix_gain"] <= 0:
+                if mpls_stats is not None:
+                    mpls_stats["fallback_longest_prefix_count"] += 1
+                SchedulePolicy._sort_by_longest_prefix(
+                    waiting_queue, temporary_deprioritized
+                )
+                return
+
+        selected_ids = {id(req) for _index, req in selected["reqs"]}
+        selected_reqs = [req for _index, req in selected["reqs"]]
+        selected_reqs.sort(
+            key=lambda req: (
+                SchedulePolicy._mpls_deadline_s(req, now),
+                SchedulePolicy._mpls_arrival_s(req),
+                str(req.rid),
+            )
+        )
+        rest = [req for req in waiting_queue if id(req) not in selected_ids]
+        SchedulePolicy._sort_by_longest_prefix(rest, temporary_deprioritized)
+        waiting_queue[:] = selected_reqs + rest
+        if mpls_stats is not None:
+            SchedulePolicy._record_mpls_selection(
+                mpls_stats, selected, selected_reqs, selected_expired
+            )
+
+    @staticmethod
+    def _record_mpls_selection(
+        mpls_stats: Dict[str, float],
+        selected: dict,
+        selected_reqs: List[Req],
+        selected_expired: bool,
+    ) -> None:
+        mpls_stats["selected_count"] += 1
+        mpls_stats["selected_expired_count"] += 1 if selected_expired else 0
+        mpls_stats["selected_req_count_total"] += len(selected_reqs)
+        mpls_stats["selected_prefix_len_total"] += float(selected["prefix_len"])
+        mpls_stats["selected_prefix_gain_total"] += float(selected["prefix_gain"])
+        mpls_stats["selected_normalized_lag_total"] += float(
+            selected["normalized_lag"]
+        )
+
+    def get_mpls_stats(self) -> dict:
+        selected_count = max(1.0, float(self.mpls_stats.get("selected_count") or 0.0))
+        calls = max(1.0, float(self.mpls_stats.get("calls") or 0.0))
+        stats = dict(self.mpls_stats)
+        stats["selected_prefix_len_avg"] = (
+            float(stats.get("selected_prefix_len_total") or 0.0) / selected_count
+        )
+        stats["selected_prefix_gain_avg"] = (
+            float(stats.get("selected_prefix_gain_total") or 0.0) / selected_count
+        )
+        stats["selected_normalized_lag_avg"] = (
+            float(stats.get("selected_normalized_lag_total") or 0.0) / selected_count
+        )
+        stats["selected_req_count_avg"] = (
+            float(stats.get("selected_req_count_total") or 0.0) / selected_count
+        )
+        stats["active_lease_count_avg"] = (
+            float(stats.get("active_lease_count_total") or 0.0) / calls
+        )
+        stats["expired_lease_count_avg"] = (
+            float(stats.get("expired_lease_count_total") or 0.0) / calls
+        )
+        return stats
+
+    @staticmethod
+    def _mpls_prefix_ladder(req: Req) -> List[dict]:
+        hint = getattr(req, "structured_hints", None)
+        raw_ladder = getattr(hint, "prefix_ladder", None) if hint is not None else None
+        entries: List[dict] = []
+        if isinstance(raw_ladder, list):
+            for raw in raw_ladder[: max(1, MPLS_MAX_LADDER_LEVELS)]:
+                if not isinstance(raw, dict):
+                    continue
+                prefix_hash = raw.get("prefix_hash") or raw.get("hash")
+                prefix_len = SchedulePolicy._safe_int(raw.get("prefix_len") or raw.get("len"), 0)
+                if isinstance(prefix_hash, str) and prefix_hash and prefix_len > 0:
+                    entries.append(
+                        {
+                            "level": str(raw.get("level") or "prefix"),
+                            "prefix_hash": prefix_hash,
+                            "prefix_len": prefix_len,
+                        }
+                    )
+            return entries
+
+        prefix_hash = (
+            getattr(hint, "prompt_prefix_hash", None)
+            or getattr(hint, "prefix_key", None)
+            if hint is not None
+            else None
+        )
+        prefix_len = SchedulePolicy._safe_int(
+            getattr(hint, "static_prefix_len", None) if hint is not None else None,
+            0,
+        )
+        if isinstance(prefix_hash, str) and prefix_hash and prefix_len > 0:
+            return [
+                {
+                    "level": "hint_prefix",
+                    "prefix_hash": prefix_hash,
+                    "prefix_len": prefix_len,
+                }
+            ]
+        return []
+
+    @staticmethod
+    def _mpls_lease_key(req: Req, entry: dict) -> tuple:
+        hint = getattr(req, "structured_hints", None)
+        return (
+            getattr(req, "extra_key", None) or "",
+            getattr(req, "lora_id", None) or "",
+            getattr(req, "grammar_key", None) or "",
+            getattr(hint, "grammar_id", None) if hint is not None else "",
+            getattr(hint, "max_tokens_bucket", None) if hint is not None else "",
+            entry["level"],
+            entry["prefix_hash"],
+            int(entry["prefix_len"]),
+        )
+
+    @staticmethod
+    def _mpls_arrival_s(req: Req) -> float:
+        return float(
+            getattr(getattr(req, "time_stats", None), "wait_queue_entry_time", 0)
+            or 0.0
+        )
+
+    @staticmethod
+    def _mpls_deadline_s(req: Req, now: float) -> float:
+        hint = getattr(req, "structured_hints", None)
+        wait_entry = SchedulePolicy._mpls_arrival_s(req)
+        latest_start_ms = (
+            getattr(hint, "latest_start_ms", None) if hint is not None else None
+        )
+        if isinstance(latest_start_ms, (int, float)) and not isinstance(
+            latest_start_ms, bool
+        ):
+            latest_start_ms = float(latest_start_ms)
+            if latest_start_ms > 1_000_000_000_000:
+                return latest_start_ms / 1000.0 - (time.time() - now)
+            if latest_start_ms > 1_000_000_000:
+                return latest_start_ms / 1000.0 - (time.time() - now)
+            if wait_entry:
+                # Treat small values as relative latest-start budget in ms.
+                return wait_entry + max(0.0, latest_start_ms / 1000.0)
+
+        raw_slack = SchedulePolicy._slo_prefix_raw_slack_s(req, now)
+        if math.isfinite(raw_slack):
+            return now + raw_slack
+        return (wait_entry or now) + MPLS_DEFAULT_BUDGET_MS / 1000.0
+
+    @staticmethod
     def _sort_by_dfs_weight(
         waiting_queue: List[Req], tree_cache: BasePrefixCache
     ) -> None:
@@ -310,6 +629,75 @@ class SchedulePolicy:
             node_to_weight,
             last_node_to_reqs,
             waiting_queue,
+        )
+
+    @staticmethod
+    def _sort_by_slo_boosted_dfs(
+        waiting_queue: List[Req], tree_cache: BasePrefixCache
+    ) -> None:
+        """Sort by DFS subtree weight with a minimal online class boost.
+
+        The base signal is still radix DFS:
+
+            base_score(u) = prefix_len(u) * waiting_count(u)
+
+        We only multiply the base score by a class-level boost:
+
+            React-heavy u: base_score * (1 + alpha * react_risk)
+            Motif-heavy u: base_score * (1 + beta * motif_lag)
+
+        For mixed subtrees, the boost is interpolated by class composition.
+        This keeps the mechanism simple and reuse-preserving: motif/react hints
+        affect traversal priority, not cache identity.
+        """
+
+        now = time.perf_counter()
+        last_node_to_reqs = defaultdict(list)
+        react_waits = []
+        motif_waits = []
+        node_to_weight = defaultdict(int)
+        node_to_react_count = defaultdict(int)
+        node_to_motif_count = defaultdict(int)
+        node_to_score = defaultdict(float)
+
+        for req in waiting_queue:
+            last_node_to_reqs[req.last_node].append(req)
+            node_to_weight[req.last_node] += 1
+            agent_type = SchedulePolicy._slo_boost_agent_type(req)
+            wait_s = SchedulePolicy._queue_wait_s(req, now)
+            if agent_type == "react":
+                node_to_react_count[req.last_node] += 1
+                react_waits.append(wait_s)
+            elif agent_type == "motif":
+                node_to_motif_count[req.last_node] += 1
+                motif_waits.append(wait_s)
+
+        react_p95 = SchedulePolicy._percentile(react_waits, 0.95)
+        motif_p95 = SchedulePolicy._percentile(motif_waits, 0.95)
+        react_target_s = max(0.001, SLO_BOOST_REACT_TARGET_MS / 1000.0)
+        motif_lag_target_s = max(0.001, SLO_BOOST_MOTIF_LAG_TARGET_MS / 1000.0)
+        react_risk = max(0.0, react_p95 / react_target_s - 1.0)
+        motif_lag = max(0.0, (motif_p95 - react_p95) / motif_lag_target_s)
+
+        SchedulePolicy._calc_slo_boosted_score(
+            tree_cache.root_node,
+            depth=0,
+            node_to_weight=node_to_weight,
+            node_to_react_count=node_to_react_count,
+            node_to_motif_count=node_to_motif_count,
+            node_to_score=node_to_score,
+            react_risk=react_risk,
+            motif_lag=motif_lag,
+        )
+
+        waiting_queue.clear()
+        SchedulePolicy._get_slo_prefix_dfs_priority(
+            tree_cache.root_node,
+            node_to_score,
+            node_to_weight,
+            last_node_to_reqs,
+            waiting_queue,
+            now,
         )
 
     @staticmethod
@@ -360,12 +748,23 @@ class SchedulePolicy:
 
     @staticmethod
     def _slo_prefix_slack_s(req: Req, now: float) -> float:
+        raw_slack = SchedulePolicy._slo_prefix_raw_slack_s(req, now)
+        eps_s = max(0.001, SLO_PREFIX_EPS_MS / 1000.0)
+        return max(eps_s, raw_slack)
+
+    @staticmethod
+    def _slo_prefix_raw_slack_s(req: Req, now: float) -> float:
         hint = getattr(req, "structured_hints", None)
-        agent_type = str(
-            getattr(hint, "agent_type", None)
-            or getattr(hint, "trace_label", None)
-            or ""
-        ).lower()
+        agent_type = SchedulePolicy._slo_agent_type(req)
+        wait_entry = getattr(getattr(req, "time_stats", None), "wait_queue_entry_time", 0)
+        deadline_ms = getattr(hint, "deadline_ms", None) if hint is not None else None
+        if isinstance(deadline_ms, (int, float)) and not isinstance(deadline_ms, bool):
+            if deadline_ms > 1_000_000_000_000:
+                # Epoch milliseconds.
+                return max(0.0, deadline_ms / 1000.0 - time.time())
+            if wait_entry:
+                return wait_entry + max(0.0, float(deadline_ms) / 1000.0) - now
+
         if agent_type == "motif":
             budget_ms = SLO_PREFIX_MOTIF_BUDGET_MS
         elif agent_type == "react":
@@ -373,10 +772,170 @@ class SchedulePolicy:
         else:
             budget_ms = SLO_PREFIX_DEFAULT_BUDGET_MS
 
-        wait_entry = getattr(getattr(req, "time_stats", None), "wait_queue_entry_time", 0)
         wait_s = max(0.0, now - wait_entry) if wait_entry else 0.0
-        eps_s = max(0.001, SLO_PREFIX_EPS_MS / 1000.0)
-        return max(eps_s, budget_ms / 1000.0 - wait_s)
+        return budget_ms / 1000.0 - wait_s
+
+    @staticmethod
+    def _slo_agent_type(req: Req) -> str:
+        hint = getattr(req, "structured_hints", None)
+        return str(
+            getattr(hint, "agent_type", None)
+            or getattr(hint, "trace_label", None)
+            or ""
+        ).lower()
+
+    @staticmethod
+    def _slo_stage_id(req: Req) -> str:
+        hint = getattr(req, "structured_hints", None)
+        return str(getattr(hint, "stage_id", None) or "").lower()
+
+    @staticmethod
+    def _slo_boost_agent_type(req: Req) -> str:
+        agent_type = SchedulePolicy._slo_agent_type(req)
+        stage_id = SchedulePolicy._slo_stage_id(req)
+        if agent_type == "motif" and stage_id == "react_fallback":
+            # The boost is meant to rescue structured Motif stages. Fallback
+            # prompts are ReAct-like long-prefix calls; treating them as Motif
+            # amplifies the wrong subtree and hurts both React and Motif tails.
+            return "react"
+        return agent_type
+
+    @staticmethod
+    def _queue_wait_s(req: Req, now: float) -> float:
+        wait_entry = getattr(getattr(req, "time_stats", None), "wait_queue_entry_time", 0)
+        return max(0.0, now - wait_entry) if wait_entry else 0.0
+
+    @staticmethod
+    def _percentile(values: List[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        sorted_values = sorted(values)
+        idx = int(math.ceil(percentile * len(sorted_values))) - 1
+        idx = min(max(idx, 0), len(sorted_values) - 1)
+        return float(sorted_values[idx])
+
+    @staticmethod
+    def _slo_prefix_marginal_cost(req: Req) -> float:
+        """Estimate the request's immediate uncached prefill cost.
+
+        Full prompt length is the wrong denominator for cache-aware scheduling:
+        a long request whose prefix is already cached is cheap at admission time.
+        SGLang's prefill budget is driven by the uncached extension length, so
+        this helper approximates that marginal cost before add_one_req recomputes
+        req.extend_input_len.
+        """
+
+        fill_len = len(getattr(req, "origin_input_ids", None) or [])
+        fill_len += len(getattr(req, "output_ids", None) or [])
+        prefix_len = SchedulePolicy._safe_len(getattr(req, "prefix_indices", None))
+        host_hit_length = max(
+            0,
+            SchedulePolicy._safe_int(getattr(req, "host_hit_length", 0), default=0),
+        )
+        return max(1.0, float(fill_len - prefix_len - host_hit_length))
+
+    @staticmethod
+    def _slo_cost_urgency(req: Req, now: float) -> float:
+        hint = getattr(req, "structured_hints", None)
+        agent_type = str(
+            getattr(hint, "agent_type", None)
+            or getattr(hint, "trace_label", None)
+            or ""
+        ).lower()
+        tau = SLO_COST_PREFIX_MOTIF_TAU_S if agent_type == "motif" else SLO_COST_PREFIX_REACT_TAU_S
+        tau = max(0.001, float(tau))
+        raw_slack = SchedulePolicy._slo_prefix_raw_slack_s(req, now)
+        exponent = max(-30.0, min(30.0, -raw_slack / tau))
+        return math.exp(exponent)
+
+    @staticmethod
+    def _slo_cost_service_cost(req: Req) -> float:
+        prompt_tokens = len(getattr(req, "origin_input_ids", None) or [])
+        prompt_tokens += len(getattr(req, "output_ids", None) or [])
+        max_new_tokens = getattr(getattr(req, "sampling_params", None), "max_new_tokens", 0)
+        try:
+            output_budget = min(max(0, int(max_new_tokens or 0)), CLIP_MAX_NEW_TOKENS)
+        except (TypeError, ValueError):
+            output_budget = 0
+        return max(
+            1.0,
+            float(prompt_tokens) + max(0.0, SLO_COST_PREFIX_DECODE_WEIGHT) * float(output_budget),
+        )
+
+    @staticmethod
+    def _semantic_fragment_key(req: Req) -> Optional[tuple]:
+        hint = getattr(req, "structured_hints", None)
+        if hint is None:
+            return None
+        agent_type = str(
+            getattr(hint, "agent_type", None)
+            or getattr(hint, "trace_label", None)
+            or ""
+        ).lower()
+        if agent_type != "motif":
+            # ReAct already appears as one large token-prefix subtree in the
+            # workloads we care about. The semantic overlay is deliberately
+            # Motif-only so it captures fragmentation rather than amplifying
+            # the dominant ReAct prefix.
+            return None
+
+        motif_id = str(getattr(hint, "motif_id", None) or "unknown_motif")
+        stage_id = str(getattr(hint, "stage_id", None) or "unknown_stage")
+        if SLO_COST_PREFIX_SEMANTIC_GROUP == "motif":
+            return ("motif", motif_id)
+        if SLO_COST_PREFIX_SEMANTIC_GROUP == "prefix":
+            prefix_hash = str(
+                getattr(hint, "prompt_prefix_hash", None)
+                or getattr(hint, "prefix_key", None)
+                or "unknown_prefix"
+            )
+            return ("motif", motif_id, stage_id, prefix_hash)
+        return ("motif", motif_id, stage_id)
+
+    @staticmethod
+    def _semantic_static_prefix_len(req: Req) -> float:
+        hint = getattr(req, "structured_hints", None)
+        value = getattr(hint, "static_prefix_len", None) if hint is not None else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return max(0.0, float(value))
+        prefix_indices = getattr(req, "prefix_indices", None)
+        try:
+            return float(len(prefix_indices))
+        except (TypeError, ValueError):
+            return float(len(getattr(req, "origin_input_ids", None) or []))
+
+    @staticmethod
+    def _safe_len(value) -> int:
+        if value is None:
+            return 0
+        numel = getattr(value, "numel", None)
+        if callable(numel):
+            try:
+                return int(numel())
+            except (TypeError, ValueError, RuntimeError):
+                return 0
+        try:
+            return len(value)
+        except (TypeError, ValueError, RuntimeError):
+            return 0
+
+    @staticmethod
+    def _safe_int(value, default: int = 0) -> int:
+        if value is None:
+            return default
+        numel = getattr(value, "numel", None)
+        item = getattr(value, "item", None)
+        if callable(numel) and callable(item):
+            try:
+                if int(numel()) == 0:
+                    return default
+                value = item()
+            except (TypeError, ValueError, RuntimeError):
+                return default
+        try:
+            return int(value)
+        except (TypeError, ValueError, RuntimeError):
+            return default
 
     @staticmethod
     def _sort_by_longest_output(
@@ -654,6 +1213,48 @@ class SchedulePolicy:
             node_to_weight[cur_node] += node_to_weight[child]
 
     @staticmethod
+    def _calc_slo_boosted_score(
+        cur_node: TreeNode,
+        depth: int,
+        node_to_weight: Dict[TreeNode, int],
+        node_to_react_count: Dict[TreeNode, int],
+        node_to_motif_count: Dict[TreeNode, int],
+        node_to_score: Dict[TreeNode, float],
+        react_risk: float,
+        motif_lag: float,
+    ) -> None:
+        for child in cur_node.children.values():
+            child_depth = depth + len(child.key or [])
+            SchedulePolicy._calc_slo_boosted_score(
+                child,
+                child_depth,
+                node_to_weight,
+                node_to_react_count,
+                node_to_motif_count,
+                node_to_score,
+                react_risk,
+                motif_lag,
+            )
+            node_to_weight[cur_node] += node_to_weight[child]
+            node_to_react_count[cur_node] += node_to_react_count[child]
+            node_to_motif_count[cur_node] += node_to_motif_count[child]
+
+        weight = node_to_weight[cur_node]
+        if weight <= 0:
+            node_to_score[cur_node] = 0.0
+            return
+
+        react_fraction = node_to_react_count[cur_node] / weight
+        motif_fraction = node_to_motif_count[cur_node] / weight
+        boost = (
+            1.0
+            + max(0.0, SLO_BOOST_REACT_ALPHA) * react_risk * react_fraction
+            + max(0.0, SLO_BOOST_MOTIF_BETA) * motif_lag * motif_fraction
+        )
+        boost = min(max(1.0, boost), max(1.0, SLO_BOOST_MAX_MULTIPLIER))
+        node_to_score[cur_node] = max(0, depth) * weight * boost
+
+    @staticmethod
     def _calc_slo_prefix_score(
         cur_node: TreeNode,
         depth: int,
@@ -681,6 +1282,100 @@ class SchedulePolicy:
         slack_gamma = max(0.0, SLO_PREFIX_SLACK_GAMMA)
         node_to_score[cur_node] = (max(0, depth) * weight) / (
             slack_sum**slack_gamma
+        )
+
+    @staticmethod
+    def _sort_by_slo_marginal_prefix_dfs(
+        waiting_queue: List[Req], tree_cache: BasePrefixCache
+    ) -> None:
+        """Sort by SLO-prefix pressure with a weak marginal prefill cost penalty.
+
+        This policy keeps the proven slo-prefix-dfs shape and only adds a weak
+        denominator based on uncached prefill tokens:
+
+            score(u) =
+                prefix_len(u) * waiting_count(u)
+                / sum(slack_i)^slack_gamma
+                / avg_marginal_prefill_cost(u)^cost_gamma
+
+        With cost_gamma=0, it degenerates to slo-prefix-dfs. The default
+        cost_gamma is intentionally small because marginal cost is a correction,
+        not the primary objective; radix locality should remain the main signal.
+        """
+
+        now = time.perf_counter()
+        last_node_to_reqs = defaultdict(list)
+        node_to_slack_sum = defaultdict(float)
+        node_to_marginal_cost_sum = defaultdict(float)
+        for req in waiting_queue:
+            last_node_to_reqs[req.last_node].append(req)
+            node_to_slack_sum[req.last_node] += SchedulePolicy._slo_prefix_slack_s(
+                req, now
+            )
+            node_to_marginal_cost_sum[
+                req.last_node
+            ] += SchedulePolicy._slo_prefix_marginal_cost(req)
+
+        node_to_weight = defaultdict(int)
+        node_to_score = defaultdict(float)
+        for node, reqs in last_node_to_reqs.items():
+            node_to_weight[node] = len(reqs)
+
+        SchedulePolicy._calc_slo_marginal_prefix_score(
+            tree_cache.root_node,
+            depth=0,
+            node_to_weight=node_to_weight,
+            node_to_slack_sum=node_to_slack_sum,
+            node_to_marginal_cost_sum=node_to_marginal_cost_sum,
+            node_to_score=node_to_score,
+        )
+
+        waiting_queue.clear()
+        SchedulePolicy._get_slo_prefix_dfs_priority(
+            tree_cache.root_node,
+            node_to_score,
+            node_to_weight,
+            last_node_to_reqs,
+            waiting_queue,
+            now,
+        )
+
+    @staticmethod
+    def _calc_slo_marginal_prefix_score(
+        cur_node: TreeNode,
+        depth: int,
+        node_to_weight: Dict[TreeNode, int],
+        node_to_slack_sum: Dict[TreeNode, float],
+        node_to_marginal_cost_sum: Dict[TreeNode, float],
+        node_to_score: Dict[TreeNode, float],
+    ) -> None:
+        for child in cur_node.children.values():
+            child_depth = depth + len(child.key or [])
+            SchedulePolicy._calc_slo_marginal_prefix_score(
+                child,
+                child_depth,
+                node_to_weight,
+                node_to_slack_sum,
+                node_to_marginal_cost_sum,
+                node_to_score,
+            )
+            node_to_weight[cur_node] += node_to_weight[child]
+            node_to_slack_sum[cur_node] += node_to_slack_sum[child]
+            node_to_marginal_cost_sum[cur_node] += node_to_marginal_cost_sum[child]
+
+        weight = node_to_weight[cur_node]
+        if weight <= 0:
+            node_to_score[cur_node] = 0.0
+            return
+
+        slack_sum = max(SLO_PREFIX_EPS_MS / 1000.0, node_to_slack_sum[cur_node])
+        slack_gamma = max(0.0, SLO_PREFIX_SLACK_GAMMA)
+        avg_marginal_cost = max(
+            1.0, node_to_marginal_cost_sum[cur_node] / max(1, weight)
+        )
+        cost_gamma = max(0.0, SLO_PREFIX_MARGINAL_COST_GAMMA)
+        node_to_score[cur_node] = (max(0, depth) * weight) / (
+            (slack_sum**slack_gamma) * (avg_marginal_cost**cost_gamma)
         )
 
     @staticmethod
@@ -725,6 +1420,189 @@ class SchedulePolicy:
             )
         reqs = last_node_to_reqs[cur_node]
         reqs.sort(key=lambda req: SchedulePolicy._slo_prefix_slack_s(req, now))
+        q.extend(reqs)
+
+    @staticmethod
+    def _sort_by_slo_cost_prefix_dfs(
+        waiting_queue: List[Req],
+        tree_cache: BasePrefixCache,
+        *,
+        semantic_overlay: bool,
+    ) -> None:
+        """Sort by reuse value, SLO urgency, and estimated prompt cost.
+
+        Pure mode scores each real radix subtree:
+
+            score(u) = max(eps, prefix_len(u) * (waiting_count(u) - 1))
+                     * sum(exp(-slack_i / tau_i))
+                     / sum(prompt_cost_i)
+
+        Semantic mode keeps the same radix cache identity, but adds a virtual
+        motif/stage pressure term to every radix subtree containing requests
+        from that semantic group. This is the semantic-fragmentation hook: a
+        Motif stage split across several small radix leaves can still build
+        group-level urgency, without pretending that different token prefixes
+        are the same cache key.
+        """
+        now = time.perf_counter()
+        last_node_to_reqs = defaultdict(list)
+        node_to_weight = defaultdict(int)
+        node_to_urgency = defaultdict(float)
+        node_to_cost = defaultdict(float)
+        node_to_score = defaultdict(float)
+        node_to_semantic_keys = defaultdict(set)
+        semantic_stats = {}
+
+        for req in waiting_queue:
+            last_node_to_reqs[req.last_node].append(req)
+            urgency = SchedulePolicy._slo_cost_urgency(req, now)
+            cost = SchedulePolicy._slo_cost_service_cost(req)
+            node_to_weight[req.last_node] += 1
+            node_to_urgency[req.last_node] += urgency
+            node_to_cost[req.last_node] += cost
+            if semantic_overlay:
+                semantic_key = SchedulePolicy._semantic_fragment_key(req)
+                if semantic_key is not None:
+                    node_to_semantic_keys[req.last_node].add(semantic_key)
+                    stats = semantic_stats.setdefault(
+                        semantic_key,
+                        {
+                            "count": 0,
+                            "urgency": 0.0,
+                            "cost": 0.0,
+                            "prefix_len": float("inf"),
+                        },
+                    )
+                    stats["count"] += 1
+                    stats["urgency"] += urgency
+                    stats["cost"] += cost
+                    stats["prefix_len"] = min(
+                        stats["prefix_len"],
+                        SchedulePolicy._semantic_static_prefix_len(req),
+                    )
+
+        semantic_group_score = {}
+        if semantic_overlay:
+            for key, stats in semantic_stats.items():
+                count = int(stats["count"])
+                prefix_len = stats["prefix_len"]
+                if prefix_len == float("inf"):
+                    prefix_len = 0.0
+                reuse_value = max(0.0, float(prefix_len)) * max(0, count - 1)
+                semantic_group_score[key] = (
+                    reuse_value
+                    * float(stats["urgency"])
+                    / max(1.0, float(stats["cost"]))
+                )
+
+        SchedulePolicy._calc_slo_cost_prefix_score(
+            tree_cache.root_node,
+            depth=0,
+            node_to_weight=node_to_weight,
+            node_to_urgency=node_to_urgency,
+            node_to_cost=node_to_cost,
+            node_to_score=node_to_score,
+            node_to_semantic_keys=node_to_semantic_keys,
+            semantic_group_score=semantic_group_score,
+            semantic_overlay=semantic_overlay,
+        )
+
+        waiting_queue.clear()
+        SchedulePolicy._get_slo_cost_prefix_dfs_priority(
+            tree_cache.root_node,
+            node_to_score,
+            node_to_weight,
+            last_node_to_reqs,
+            waiting_queue,
+            now,
+        )
+
+    @staticmethod
+    def _calc_slo_cost_prefix_score(
+        cur_node: TreeNode,
+        depth: int,
+        node_to_weight: Dict[TreeNode, int],
+        node_to_urgency: Dict[TreeNode, float],
+        node_to_cost: Dict[TreeNode, float],
+        node_to_score: Dict[TreeNode, float],
+        node_to_semantic_keys: Dict[TreeNode, Set[tuple]],
+        semantic_group_score: Dict[tuple, float],
+        semantic_overlay: bool,
+    ) -> None:
+        for child in cur_node.children.values():
+            child_depth = depth + len(child.key or [])
+            SchedulePolicy._calc_slo_cost_prefix_score(
+                child,
+                child_depth,
+                node_to_weight,
+                node_to_urgency,
+                node_to_cost,
+                node_to_score,
+                node_to_semantic_keys,
+                semantic_group_score,
+                semantic_overlay,
+            )
+            node_to_weight[cur_node] += node_to_weight[child]
+            node_to_urgency[cur_node] += node_to_urgency[child]
+            node_to_cost[cur_node] += node_to_cost[child]
+            if semantic_overlay and node_to_semantic_keys[child]:
+                node_to_semantic_keys[cur_node].update(node_to_semantic_keys[child])
+
+        weight = node_to_weight[cur_node]
+        if weight <= 0:
+            node_to_score[cur_node] = 0.0
+            return
+
+        reuse_value = max(
+            SLO_COST_PREFIX_MIN_REUSE_VALUE,
+            max(0, depth) * max(0, weight - 1),
+        )
+        prefix_score = (
+            float(reuse_value)
+            * float(node_to_urgency[cur_node])
+            / max(1.0, float(node_to_cost[cur_node]))
+        )
+        semantic_score = 0.0
+        if semantic_overlay:
+            semantic_score = SLO_COST_PREFIX_SEMANTIC_WEIGHT * sum(
+                semantic_group_score.get(key, 0.0)
+                for key in node_to_semantic_keys[cur_node]
+            )
+        node_to_score[cur_node] = prefix_score + semantic_score
+
+    @staticmethod
+    def _get_slo_cost_prefix_dfs_priority(
+        cur_node: TreeNode,
+        node_to_score: Dict[TreeNode, float],
+        node_to_weight: Dict[TreeNode, int],
+        last_node_to_reqs: Dict[TreeNode, List[Req]],
+        q: List,
+        now: float,
+    ) -> None:
+        children = [child for child in cur_node.children.values()]
+        children.sort(
+            key=lambda x: (
+                -node_to_score[x],
+                -node_to_weight[x],
+            )
+        )
+        for child in children:
+            SchedulePolicy._get_slo_cost_prefix_dfs_priority(
+                child,
+                node_to_score,
+                node_to_weight,
+                last_node_to_reqs,
+                q,
+                now,
+            )
+        reqs = last_node_to_reqs[cur_node]
+        reqs.sort(
+            key=lambda req: (
+                SchedulePolicy._slo_prefix_raw_slack_s(req, now),
+                SchedulePolicy._slo_cost_service_cost(req),
+                getattr(getattr(req, "time_stats", None), "wait_queue_entry_time", 0),
+            )
+        )
         q.extend(reqs)
 
     def _sort_by_slo_prefix_mixed_dfs(
@@ -1192,9 +2070,15 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
+                load_back_start = time.perf_counter()
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     req.last_host_node, req.host_hit_length
                 )
+                req.load_back_submit_wall_ms = (
+                    time.perf_counter() - load_back_start
+                ) * 1000.0
+                req.load_back_tokens = int(new_indices.numel())
+                req.load_back_submitted = req.load_back_tokens > 0
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)

@@ -323,6 +323,7 @@ class RadixCache(BasePrefixCache):
         mock_allocator: Optional[Any] = None,
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
+        eviction_policy: str = "lru",
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -331,6 +332,7 @@ class RadixCache(BasePrefixCache):
             token_to_kv_pool_allocator=mock_allocator,
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
+            eviction_policy=eviction_policy,
         )
         return RadixCache(params)
 
@@ -775,10 +777,20 @@ class RadixCache(BasePrefixCache):
         existing_active = node.effective_priority() > 0.0
         if not existing_active or priority >= node.effective_priority():
             if node.effective_priority() <= 0.0:
-                self.priority_protected_blocks += 0 if node.value is None else len(node.value)
+                self.priority_protected_blocks += self._node_value_len(node)
             node.priority = priority
             node.cache_pin_expires_at = cache_pin_expires_at
             node.cache_hint_prefix_key = cache_hint_prefix_key
+
+    @staticmethod
+    def _node_value_len(node: TreeNode) -> int:
+        value = getattr(node, "value", None)
+        if value is None:
+            return 0
+        try:
+            return len(value)
+        except TypeError:
+            return 0
 
     def _insert_helper(
         self,
@@ -831,6 +843,8 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            if new_node.effective_priority() > 0.0:
+                self.priority_protected_blocks += self._node_value_len(new_node)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
