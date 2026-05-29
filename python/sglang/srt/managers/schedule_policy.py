@@ -58,9 +58,11 @@ SLO_COST_PREFIX_MIN_REUSE_VALUE = float(
 SLO_COST_PREFIX_SEMANTIC_GROUP = os.environ.get(
     "SGLANG_SLO_COST_PREFIX_SEMANTIC_GROUP", "stage"
 ).strip().lower()
-MPLS_TOP_K = int(os.environ.get("SGLANG_MPLS_TOP_K", "32"))
 MPLS_MAX_LADDER_LEVELS = int(os.environ.get("SGLANG_MPLS_MAX_LADDER_LEVELS", "6"))
 MPLS_DEFAULT_BUDGET_MS = float(os.environ.get("SGLANG_MPLS_DEFAULT_BUDGET_MS", "10000"))
+MPLS_BRIDGE_RELEASE_WEIGHT = float(
+    os.environ.get("SGLANG_MPLS_BRIDGE_RELEASE_WEIGHT", "1.0")
+)
 logger = logging.getLogger(__name__)
 
 # Copyright 2023-2024 SGLang Team
@@ -374,6 +376,7 @@ class SchedulePolicy:
         if mpls_stats is not None:
             mpls_stats["calls"] += 1
             mpls_stats["waiting_req_count_total"] += len(waiting_queue)
+        ready_prefix_index = SchedulePolicy._mpls_ready_prefix_index(waiting_queue)
         leases: Dict[tuple, dict] = {}
         for original_index, req in enumerate(waiting_queue):
             for entry in SchedulePolicy._mpls_prefix_ladder(req):
@@ -388,6 +391,10 @@ class SchedulePolicy:
                         "reqs": [],
                         "first_arrival": float("inf"),
                         "deadline": float("inf"),
+                        "prefix_gain_ms": 0.0,
+                        "release_gain_ms": 0.0,
+                        "bridge_release_gain_ms": 0.0,
+                        "total_gain_ms": 0.0,
                     },
                 )
                 lease["reqs"].append((original_index, req))
@@ -412,9 +419,23 @@ class SchedulePolicy:
                 continue
             denominator = max(1e-3, lease["deadline"] - lease["first_arrival"])
             normalized_lag = (now - lease["first_arrival"]) / denominator
-            prefix_gain = max(0, req_count - 1) * max(0, int(lease["prefix_len"]))
+            prefix_gain = SchedulePolicy._mpls_prefix_gain_ms(lease)
+            direct_release_gain = sum(
+                SchedulePolicy._mpls_downstream_release_gain_ms(req)
+                for _index, req in lease["reqs"]
+            )
+            bridge_release_gain = sum(
+                SchedulePolicy._mpls_bridge_release_gain_ms(req, ready_prefix_index)
+                for _index, req in lease["reqs"]
+            )
+            release_gain = direct_release_gain + bridge_release_gain
+            total_gain = prefix_gain + release_gain
             lease["normalized_lag"] = normalized_lag
             lease["prefix_gain"] = prefix_gain
+            lease["prefix_gain_ms"] = prefix_gain
+            lease["release_gain_ms"] = release_gain
+            lease["bridge_release_gain_ms"] = bridge_release_gain
+            lease["total_gain_ms"] = total_gain
             scored_leases.append(lease)
 
         if not scored_leases:
@@ -435,30 +456,23 @@ class SchedulePolicy:
                 key=lambda lease: (
                     lease["deadline"],
                     lease["first_arrival"],
-                    -lease["prefix_gain"],
+                    -lease["total_gain_ms"],
+                    -lease["prefix_gain_ms"],
                 ),
             )
             selected_expired = True
         else:
-            candidates = sorted(
+            selected = max(
                 scored_leases,
                 key=lambda lease: (
-                    lease["normalized_lag"],
-                    lease["prefix_gain"],
-                    lease["prefix_len"],
-                ),
-                reverse=True,
-            )[: max(1, MPLS_TOP_K)]
-            selected = max(
-                candidates,
-                key=lambda lease: (
-                    lease["prefix_gain"],
+                    lease["total_gain_ms"],
+                    lease["prefix_gain_ms"],
                     lease["normalized_lag"],
                     lease["prefix_len"],
                 ),
             )
             selected_expired = False
-            if selected["prefix_gain"] <= 0:
+            if selected["total_gain_ms"] <= 0:
                 if mpls_stats is not None:
                     mpls_stats["fallback_longest_prefix_count"] += 1
                 SchedulePolicy._sort_by_longest_prefix(
@@ -495,6 +509,15 @@ class SchedulePolicy:
         mpls_stats["selected_req_count_total"] += len(selected_reqs)
         mpls_stats["selected_prefix_len_total"] += float(selected["prefix_len"])
         mpls_stats["selected_prefix_gain_total"] += float(selected["prefix_gain"])
+        mpls_stats["selected_release_gain_ms_total"] += float(
+            selected.get("release_gain_ms") or 0.0
+        )
+        mpls_stats["selected_bridge_release_gain_ms_total"] += float(
+            selected.get("bridge_release_gain_ms") or 0.0
+        )
+        mpls_stats["selected_total_gain_ms_total"] += float(
+            selected.get("total_gain_ms") or 0.0
+        )
         mpls_stats["selected_normalized_lag_total"] += float(
             selected["normalized_lag"]
         )
@@ -508,6 +531,18 @@ class SchedulePolicy:
         )
         stats["selected_prefix_gain_avg"] = (
             float(stats.get("selected_prefix_gain_total") or 0.0) / selected_count
+        )
+        stats["selected_release_gain_ms_avg"] = (
+            float(stats.get("selected_release_gain_ms_total") or 0.0)
+            / selected_count
+        )
+        stats["selected_bridge_release_gain_ms_avg"] = (
+            float(stats.get("selected_bridge_release_gain_ms_total") or 0.0)
+            / selected_count
+        )
+        stats["selected_total_gain_ms_avg"] = (
+            float(stats.get("selected_total_gain_ms_total") or 0.0)
+            / selected_count
         )
         stats["selected_normalized_lag_avg"] = (
             float(stats.get("selected_normalized_lag_total") or 0.0) / selected_count
@@ -565,6 +600,26 @@ class SchedulePolicy:
         return []
 
     @staticmethod
+    def _mpls_ready_prefix_index(waiting_queue: List[Req]) -> Dict[tuple, dict]:
+        index: Dict[tuple, dict] = {}
+        for req in waiting_queue:
+            for entry in SchedulePolicy._mpls_prefix_ladder(req):
+                key = (entry["level"], entry["prefix_hash"])
+                bucket = index.setdefault(
+                    key,
+                    {"req_ids": set(), "prefix_len": 0.0, "ms_per_token": 0.0},
+                )
+                bucket["req_ids"].add(id(req))
+                bucket["prefix_len"] = max(
+                    float(bucket["prefix_len"]), float(entry["prefix_len"])
+                )
+                bucket["ms_per_token"] = max(
+                    float(bucket["ms_per_token"]),
+                    SchedulePolicy._mpls_prefill_ms_per_token(req),
+                )
+        return index
+
+    @staticmethod
     def _mpls_lease_key(req: Req, entry: dict) -> tuple:
         hint = getattr(req, "structured_hints", None)
         return (
@@ -586,12 +641,184 @@ class SchedulePolicy:
         )
 
     @staticmethod
+    def _mpls_prefill_ms_per_token(req: Req) -> float:
+        hint = getattr(req, "structured_hints", None)
+        saved_ms = getattr(hint, "saved_prefill_cost_ms", None) if hint else None
+        static_len = getattr(hint, "static_prefix_len", None) if hint else None
+        if (
+            isinstance(saved_ms, (int, float))
+            and not isinstance(saved_ms, bool)
+            and isinstance(static_len, (int, float))
+            and not isinstance(static_len, bool)
+            and float(saved_ms) > 0
+            and float(static_len) > 0
+        ):
+            return max(1e-6, float(saved_ms) / float(static_len))
+        return 1.0
+
+    @staticmethod
+    def _mpls_prefix_gain_ms(lease: dict) -> float:
+        reqs = [req for _index, req in lease["reqs"]]
+        if len(reqs) <= 1:
+            return 0.0
+        ms_per_token = max(
+            SchedulePolicy._mpls_prefill_ms_per_token(req) for req in reqs
+        )
+        return (
+            max(0.0, float(len(reqs) - 1))
+            * max(0.0, float(lease["prefix_len"]))
+            * ms_per_token
+        )
+
+    @staticmethod
+    def _mpls_downstream_release_gain_ms(req: Req) -> float:
+        hint = getattr(req, "structured_hints", None)
+        raw = getattr(hint, "downstream_release_credit", None) if hint else None
+        if not raw:
+            return 0.0
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return max(0.0, float(raw))
+        if not isinstance(raw, dict):
+            return 0.0
+
+        for key in ("release_gain_ms", "saved_ms", "score_ms"):
+            value = raw.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return max(0.0, float(value)) * SchedulePolicy._mpls_structural_unlock_multiplier(raw)
+
+        for key in ("score", "credit", "release_gain"):
+            value = raw.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return (
+                    max(0.0, float(value))
+                    * SchedulePolicy._mpls_prefill_ms_per_token(req)
+                    * SchedulePolicy._mpls_structural_unlock_multiplier(raw)
+                )
+
+        expected_ready = raw.get("expected_ready_count")
+        prefix_len = raw.get("downstream_prefix_len", raw.get("prefix_len"))
+        if (
+            isinstance(expected_ready, (int, float))
+            and not isinstance(expected_ready, bool)
+            and isinstance(prefix_len, (int, float))
+            and not isinstance(prefix_len, bool)
+        ):
+            return (
+                max(0.0, float(expected_ready))
+                * max(0.0, float(prefix_len))
+                * SchedulePolicy._mpls_prefill_ms_per_token(req)
+                * SchedulePolicy._mpls_structural_unlock_multiplier(raw)
+            )
+        structural_score = SchedulePolicy._mpls_structural_unlock_multiplier(raw)
+        return max(0.0, structural_score - 1.0) * SchedulePolicy._mpls_prefill_ms_per_token(req)
+
+    @staticmethod
+    def _mpls_structural_unlock_multiplier(raw: dict) -> float:
+        if not isinstance(raw, dict):
+            return 1.0
+        value = raw.get("structural_unlock_score")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            value = raw.get("critical_path_unlock_score")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return max(0.25, min(4.0, float(value)))
+        downstream = SchedulePolicy._safe_float(raw.get("downstream_reachable_count"), 0.0)
+        depth = SchedulePolicy._safe_float(raw.get("critical_path_depth"), 0.0)
+        if downstream <= 0.0 and depth <= 0.0:
+            return 1.0
+        return max(0.25, min(4.0, 1.0 + 0.25 * downstream + 0.15 * depth))
+
+    @staticmethod
+    def _mpls_bridge_release_gain_ms(req: Req, ready_prefix_index: Dict[tuple, dict]) -> float:
+        hint = getattr(req, "structured_hints", None)
+        raw = getattr(hint, "downstream_release_credit", None) if hint else None
+        if not isinstance(raw, dict) or not ready_prefix_index:
+            return 0.0
+        future_entries = SchedulePolicy._mpls_future_prefix_entries(raw)
+        if not future_entries:
+            return 0.0
+        expected_ready = SchedulePolicy._safe_float(raw.get("expected_ready_count"), 1.0)
+        expected_ready = max(1.0, expected_ready)
+        confidence = SchedulePolicy._safe_float(raw.get("confidence"), 1.0)
+        confidence = max(0.0, min(1.0, confidence))
+        ms_per_token = SchedulePolicy._mpls_prefill_ms_per_token(req)
+
+        best_gain = 0.0
+        for entry in future_entries:
+            bucket = ready_prefix_index.get((entry["level"], entry["prefix_hash"]))
+            if not bucket:
+                continue
+            req_ids = bucket.get("req_ids")
+            ready_match_count = (
+                max(0, len(req_ids - {id(req)})) if isinstance(req_ids, set) else 1
+            )
+            if ready_match_count <= 0:
+                continue
+            shared_len = min(
+                float(entry["prefix_len"]),
+                float(bucket.get("prefix_len") or 0.0),
+            )
+            if shared_len <= 0.0:
+                continue
+            best_gain = max(
+                best_gain,
+                shared_len
+                * max(ms_per_token, float(bucket.get("ms_per_token") or 0.0))
+                * expected_ready
+                * float(ready_match_count)
+                * confidence
+                * SchedulePolicy._mpls_structural_unlock_multiplier(raw)
+                * MPLS_BRIDGE_RELEASE_WEIGHT,
+            )
+        return max(0.0, best_gain)
+
+    @staticmethod
+    def _mpls_future_prefix_entries(raw: dict) -> List[dict]:
+        entries: List[dict] = []
+        rows = raw.get("downstream_prefix_ladder") or raw.get("future_prefix_ladder")
+        if isinstance(rows, list):
+            for index, row in enumerate(rows[: max(1, MPLS_MAX_LADDER_LEVELS)]):
+                if not isinstance(row, dict):
+                    continue
+                prefix_hash = row.get("prefix_hash") or row.get("hash")
+                prefix_len = SchedulePolicy._safe_int(
+                    row.get("prefix_len") or row.get("len"), 0
+                )
+                if isinstance(prefix_hash, str) and prefix_hash and prefix_len > 0:
+                    entries.append(
+                        {
+                            "level": str(row.get("level") or f"future_{index}"),
+                            "prefix_hash": prefix_hash,
+                            "prefix_len": prefix_len,
+                        }
+                    )
+        prefix_hash = raw.get("downstream_prefix_hash") or raw.get("prefix_hash")
+        prefix_len = SchedulePolicy._safe_int(
+            raw.get("downstream_prefix_len") or raw.get("prefix_len"), 0
+        )
+        if isinstance(prefix_hash, str) and prefix_hash and prefix_len > 0:
+            entries.append(
+                {
+                    "level": str(
+                        raw.get("downstream_prefix_level")
+                        or raw.get("level")
+                        or "prefix"
+                    ),
+                    "prefix_hash": prefix_hash,
+                    "prefix_len": prefix_len,
+                }
+            )
+        return entries
+
+    @staticmethod
     def _mpls_deadline_s(req: Req, now: float) -> float:
         hint = getattr(req, "structured_hints", None)
         wait_entry = SchedulePolicy._mpls_arrival_s(req)
-        latest_start_ms = (
-            getattr(hint, "latest_start_ms", None) if hint is not None else None
-        )
+        latest_start_ms = None
+        if hint is not None:
+            latest_start_ms = (
+                getattr(hint, "internal_latest_start_ms", None)
+                or getattr(hint, "latest_start_ms", None)
+            )
         if isinstance(latest_start_ms, (int, float)) and not isinstance(
             latest_start_ms, bool
         ):
@@ -936,6 +1163,27 @@ class SchedulePolicy:
             return int(value)
         except (TypeError, ValueError, RuntimeError):
             return default
+
+    @staticmethod
+    def _safe_float(value, default: float = 0.0) -> float:
+        if value is None or isinstance(value, bool):
+            return default
+        numel = getattr(value, "numel", None)
+        item = getattr(value, "item", None)
+        if callable(numel) and callable(item):
+            try:
+                if int(numel()) == 0:
+                    return default
+                value = item()
+            except (TypeError, ValueError, RuntimeError):
+                return default
+        try:
+            number = float(value)
+        except (TypeError, ValueError, RuntimeError):
+            return default
+        if math.isnan(number) or math.isinf(number):
+            return default
+        return number
 
     @staticmethod
     def _sort_by_longest_output(

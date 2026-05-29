@@ -174,6 +174,8 @@ class StructuredRequestHints:
     prompt_prefix_hash: Optional[str] = None
     prefix_ladder: Optional[List[Dict[str, Any]]] = None
     latest_start_ms: Optional[float] = None
+    internal_latest_start_ms: Optional[float] = None
+    downstream_release_credit: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_raw(
@@ -209,6 +211,8 @@ class StructuredRequestHints:
             "deadline_ms",
             "latest_start_ms",
             "latest_start_us",
+            "internal_latest_start_ms",
+            "internal_latest_start_us",
             "next_stage_prob",
             "expected_tool_latency_ms",
             "cache_pin_ttl_ms",
@@ -227,6 +231,8 @@ class StructuredRequestHints:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 if field_name == "latest_start_us":
                     values["latest_start_ms"] = float(value) / 1000.0
+                elif field_name == "internal_latest_start_us":
+                    values["internal_latest_start_ms"] = float(value) / 1000.0
                 else:
                     values[field_name] = float(value)
         prefix_ladder = raw.get("prefix_ladder")
@@ -253,7 +259,76 @@ class StructuredRequestHints:
                 )
             if clean_ladder:
                 values["prefix_ladder"] = clean_ladder
+        release_credit = cls._clean_downstream_release_credit(
+            raw.get("downstream_release_credit")
+        )
+        if release_credit:
+            values["downstream_release_credit"] = release_credit
         return cls(**values) if values else None
+
+    @staticmethod
+    def _clean_downstream_release_credit(raw: Any) -> Dict[str, Any]:
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return {"release_gain_ms": float(raw)}
+        if not isinstance(raw, Mapping):
+            return {}
+
+        clean: Dict[str, Any] = {}
+        for key in (
+            "release_gain_ms",
+            "saved_ms",
+            "score_ms",
+            "score",
+            "credit",
+            "release_gain",
+            "expected_ready_count",
+            "downstream_prefix_len",
+            "prefix_len",
+            "confidence",
+            "structural_unlock_score",
+            "critical_path_unlock_score",
+            "critical_path_depth",
+            "downstream_reachable_count",
+            "source_downstream_reachable_count",
+            "verified_edge_count",
+            "semantic_required_edge_count",
+            "immediate_rule_edge_count",
+            "verified_weight",
+            "semantic_required_weight",
+            "semantic_required_confidence",
+        ):
+            value = raw.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                clean[key] = float(value)
+        for key in (
+            "downstream_stage_id",
+            "source_stage_id",
+            "stage_id",
+            "downstream_prefix_hash",
+            "prefix_hash",
+            "release_class",
+            "dominant_edge_status",
+            "downstream_prefix_level",
+            "downstream_prefix_source",
+            "stage_position",
+            "source_stage_position",
+        ):
+            value = raw.get(key)
+            if isinstance(value, str) and value:
+                clean[key] = value
+        for key in ("pin_eligible",):
+            value = raw.get(key)
+            if isinstance(value, bool):
+                clean[key] = value
+        for key in ("release_sources",):
+            value = raw.get(key)
+            if isinstance(value, list):
+                clean[key] = [str(item) for item in value if str(item)]
+        for key in ("downstream_prefix_ladder", "future_prefix_ladder"):
+            value = raw.get(key)
+            if isinstance(value, list):
+                clean[key] = [item for item in value if isinstance(item, Mapping)]
+        return clean
 
     def to_dict(self) -> Dict[str, Any]:
         return {

@@ -61,6 +61,33 @@ class TestStructuredRequestHints(unittest.TestCase):
         self.assertIsNone(hints.deadline_ms)
         self.assertEqual(hints.cache_affinity_key, "worker-group-a")
 
+    def test_dependency_hints_are_normalized(self):
+        hints = StructuredRequestHints.from_raw(
+            {
+                "latest_start_ms": 500,
+                "internal_latest_start_us": 125_000,
+                "downstream_release_credit": {
+                    "expected_ready_count": 2,
+                    "downstream_prefix_len": 80,
+                    "release_gain_ms": 25,
+                    "downstream_stage_id": "stage-b",
+                    "ignored": "value",
+                },
+            }
+        )
+
+        self.assertEqual(hints.latest_start_ms, 500.0)
+        self.assertEqual(hints.internal_latest_start_ms, 125.0)
+        self.assertEqual(
+            hints.downstream_release_credit,
+            {
+                "release_gain_ms": 25.0,
+                "expected_ready_count": 2.0,
+                "downstream_prefix_len": 80.0,
+                "downstream_stage_id": "stage-b",
+            },
+        )
+
     def test_generate_req_input_expands_hints_for_batch(self):
         request = GenerateReqInput(
             text=["a", "b"],
