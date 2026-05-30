@@ -207,6 +207,28 @@ class TestMplsScheduling(unittest.TestCase):
         stats = policy.get_mpls_stats()
         self.assertEqual(stats["selected_total_gain_ms_avg"], 150.0)
 
+    def test_mpls_non_expired_tie_does_not_use_latest_start(self):
+        older_ladder = [
+            {"level": "stage", "prefix_hash": "older", "prefix_len": 100}
+        ]
+        urgent_ladder = [
+            {"level": "stage", "prefix_hash": "urgent", "prefix_len": 100}
+        ]
+        waiting_queue = [
+            _req("urgent-0", [2, 20], ladder=urgent_ladder, arrival=1.03, latest_start_ms=80),
+            _req("older-0", [1, 10], ladder=older_ladder, arrival=1.0, latest_start_ms=500),
+            _req("urgent-1", [2, 21], ladder=urgent_ladder, arrival=1.03, latest_start_ms=80),
+            _req("older-1", [1, 11], ladder=older_ladder, arrival=1.0, latest_start_ms=500),
+        ]
+
+        with patch("sglang.srt.managers.schedule_policy.time.perf_counter", return_value=1.05):
+            policy = self._policy()
+            policy.calc_priority(waiting_queue)
+
+        self.assertEqual([req.rid for req in waiting_queue[:2]], ["older-0", "older-1"])
+        stats = policy.get_mpls_stats()
+        self.assertEqual(stats["selected_expired_count"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

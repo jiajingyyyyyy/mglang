@@ -62,6 +62,7 @@ class InsertParams:
     priority: float = 0.0
     cache_pin_expires_at: Optional[float] = None
     cache_hint_prefix_key: Optional[str] = None
+    cache_pin_ranges: Optional[list[dict[str, Any]]] = None
 
 
 @dataclasses.dataclass

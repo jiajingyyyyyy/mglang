@@ -466,9 +466,10 @@ class SchedulePolicy:
                 scored_leases,
                 key=lambda lease: (
                     lease["total_gain_ms"],
+                    lease["release_gain_ms"],
                     lease["prefix_gain_ms"],
-                    lease["normalized_lag"],
                     lease["prefix_len"],
+                    -lease["first_arrival"],
                 ),
             )
             selected_expired = False
@@ -482,13 +483,21 @@ class SchedulePolicy:
 
         selected_ids = {id(req) for _index, req in selected["reqs"]}
         selected_reqs = [req for _index, req in selected["reqs"]]
-        selected_reqs.sort(
-            key=lambda req: (
-                SchedulePolicy._mpls_deadline_s(req, now),
-                SchedulePolicy._mpls_arrival_s(req),
-                str(req.rid),
+        if selected_expired:
+            selected_reqs.sort(
+                key=lambda req: (
+                    SchedulePolicy._mpls_deadline_s(req, now),
+                    SchedulePolicy._mpls_arrival_s(req),
+                    str(req.rid),
+                )
             )
-        )
+        else:
+            selected_reqs.sort(
+                key=lambda req: (
+                    SchedulePolicy._mpls_arrival_s(req),
+                    str(req.rid),
+                )
+            )
         rest = [req for req in waiting_queue if id(req) not in selected_ids]
         SchedulePolicy._sort_by_longest_prefix(rest, temporary_deprioritized)
         waiting_queue[:] = selected_reqs + rest

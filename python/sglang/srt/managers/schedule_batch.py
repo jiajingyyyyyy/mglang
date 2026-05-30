@@ -610,7 +610,16 @@ class Req(ReqDllmMixin):
         self.routing_key = routing_key
         self.structured_hints = structured_hints
         self.cache_priority = self._cache_priority_from_structured_hints(structured_hints)
+        self.cache_pin_ttl_ms = self._cache_pin_ttl_ms_from_structured_hints(
+            structured_hints
+        )
+        self.cache_pin_mode = (
+            getattr(structured_hints, "cache_pin_mode", None) if structured_hints else None
+        )
         self.cache_pin_expires_at = self._cache_pin_expires_at_from_structured_hints(
+            structured_hints
+        )
+        self.cache_pin_ranges = self._cache_pin_ranges_from_structured_hints(
             structured_hints
         )
         self.cache_hint_prefix_key = (
@@ -863,6 +872,65 @@ class Req(ReqDllmMixin):
         except (TypeError, ValueError):
             return None
         return time.monotonic() + ttl_s
+
+    @staticmethod
+    def _cache_pin_ttl_ms_from_structured_hints(structured_hints) -> Optional[float]:
+        if structured_hints is None:
+            return None
+        ttl_ms = getattr(structured_hints, "cache_pin_ttl_ms", None)
+        if ttl_ms is None:
+            return None
+        try:
+            return max(0.0, float(ttl_ms))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _cache_pin_ranges_from_structured_hints(structured_hints) -> List[Dict[str, Any]]:
+        if structured_hints is None:
+            return []
+        mode = str(getattr(structured_hints, "cache_pin_mode", "") or "").lower()
+        if mode not in {"layered_static", "layered"}:
+            return []
+        raw_ranges = getattr(structured_hints, "cache_pin_ranges", None)
+        if not isinstance(raw_ranges, list):
+            return []
+        now = time.monotonic()
+        ranges: List[Dict[str, Any]] = []
+        for raw in raw_ranges:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                start = max(0, int(raw.get("start", 0)))
+                end = max(start, int(raw.get("end", 0)))
+                priority = max(0.0, float(raw.get("priority", 0.0)))
+            except (TypeError, ValueError):
+                continue
+            if end <= start or priority <= 0.0:
+                continue
+            ttl_ms = raw.get("cache_pin_ttl_ms", raw.get("ttl_ms"))
+            clean_ttl_ms = None
+            expires_at = None
+            if ttl_ms is not None:
+                try:
+                    clean_ttl_ms = max(0.0, float(ttl_ms))
+                    expires_at = now + clean_ttl_ms / 1000.0
+                except (TypeError, ValueError):
+                    expires_at = None
+            ranges.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "priority": priority,
+                    "cache_pin_ttl_ms": clean_ttl_ms,
+                    "cache_pin_expires_at": expires_at,
+                    "cache_hint_prefix_key": str(raw.get("prefix_hash") or ""),
+                    "level": str(raw.get("level") or "prefix"),
+                    "source": str(raw.get("source") or "structured"),
+                }
+            )
+        ranges.sort(key=lambda item: (item["start"], item["end"], -item["priority"]))
+        return ranges
 
     @property
     def seqlen(self) -> int:
