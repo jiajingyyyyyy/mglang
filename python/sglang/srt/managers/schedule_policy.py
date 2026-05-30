@@ -58,11 +58,7 @@ SLO_COST_PREFIX_MIN_REUSE_VALUE = float(
 SLO_COST_PREFIX_SEMANTIC_GROUP = os.environ.get(
     "SGLANG_SLO_COST_PREFIX_SEMANTIC_GROUP", "stage"
 ).strip().lower()
-MPLS_MAX_LADDER_LEVELS = int(os.environ.get("SGLANG_MPLS_MAX_LADDER_LEVELS", "6"))
 MPLS_DEFAULT_BUDGET_MS = float(os.environ.get("SGLANG_MPLS_DEFAULT_BUDGET_MS", "10000"))
-MPLS_BRIDGE_RELEASE_WEIGHT = float(
-    os.environ.get("SGLANG_MPLS_BRIDGE_RELEASE_WEIGHT", "1.0")
-)
 logger = logging.getLogger(__name__)
 
 # Copyright 2023-2024 SGLang Team
@@ -573,7 +569,7 @@ class SchedulePolicy:
         raw_ladder = getattr(hint, "prefix_ladder", None) if hint is not None else None
         entries: List[dict] = []
         if isinstance(raw_ladder, list):
-            for raw in raw_ladder[: max(1, MPLS_MAX_LADDER_LEVELS)]:
+            for raw in raw_ladder:
                 if not isinstance(raw, dict):
                     continue
                 prefix_hash = raw.get("prefix_hash") or raw.get("hash")
@@ -693,7 +689,7 @@ class SchedulePolicy:
         for key in ("release_gain_ms", "saved_ms", "score_ms"):
             value = raw.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return max(0.0, float(value)) * SchedulePolicy._mpls_structural_unlock_multiplier(raw)
+                return max(0.0, float(value))
 
         for key in ("score", "credit", "release_gain"):
             value = raw.get(key)
@@ -713,13 +709,24 @@ class SchedulePolicy:
             and not isinstance(prefix_len, bool)
         ):
             return (
-                max(0.0, float(expected_ready))
-                * max(0.0, float(prefix_len))
-                * SchedulePolicy._mpls_prefill_ms_per_token(req)
-                * SchedulePolicy._mpls_structural_unlock_multiplier(raw)
-            )
+                    max(0.0, float(expected_ready))
+                    * max(0.0, float(prefix_len))
+                    * SchedulePolicy._mpls_prefill_ms_per_token(req)
+                    * SchedulePolicy._mpls_explicit_structural_unlock_multiplier(raw)
+                )
         structural_score = SchedulePolicy._mpls_structural_unlock_multiplier(raw)
         return max(0.0, structural_score - 1.0) * SchedulePolicy._mpls_prefill_ms_per_token(req)
+
+    @staticmethod
+    def _mpls_explicit_structural_unlock_multiplier(raw: dict) -> float:
+        if not isinstance(raw, dict):
+            return 1.0
+        value = raw.get("structural_unlock_score")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            value = raw.get("critical_path_unlock_score")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return max(0.25, min(4.0, float(value)))
+        return 1.0
 
     @staticmethod
     def _mpls_structural_unlock_multiplier(raw: dict) -> float:
@@ -775,8 +782,7 @@ class SchedulePolicy:
                 * expected_ready
                 * float(ready_match_count)
                 * confidence
-                * SchedulePolicy._mpls_structural_unlock_multiplier(raw)
-                * MPLS_BRIDGE_RELEASE_WEIGHT,
+                * SchedulePolicy._mpls_explicit_structural_unlock_multiplier(raw),
             )
         return max(0.0, best_gain)
 
@@ -785,7 +791,7 @@ class SchedulePolicy:
         entries: List[dict] = []
         rows = raw.get("downstream_prefix_ladder") or raw.get("future_prefix_ladder")
         if isinstance(rows, list):
-            for index, row in enumerate(rows[: max(1, MPLS_MAX_LADDER_LEVELS)]):
+            for index, row in enumerate(rows):
                 if not isinstance(row, dict):
                     continue
                 prefix_hash = row.get("prefix_hash") or row.get("hash")
