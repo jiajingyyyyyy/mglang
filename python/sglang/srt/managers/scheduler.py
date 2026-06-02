@@ -2048,6 +2048,19 @@ class Scheduler(
             hint = getattr(req, "structured_hints", None)
             wait_entry = getattr(req.time_stats, "wait_queue_entry_time", 0) or 0
             expires_at = getattr(req, "cache_pin_expires_at", None)
+            cache_pin_ttl_s = getattr(req, "cache_pin_ttl_s", None)
+            cache_pin_ranges = getattr(req, "cache_pin_ranges", None) or []
+            cache_pin_range_tokens = sum(
+                max(0, int((row.get("end") or 0) - (row.get("start") or 0)))
+                for row in cache_pin_ranges
+                if isinstance(row, dict)
+            )
+            cache_pin_alive = bool(expires_at and expires_at > now_perf)
+            if expires_at is None and cache_pin_ttl_s is not None:
+                cache_pin_alive = (
+                    float(getattr(req, "cache_priority", 0.0) or 0.0) > 0.0
+                    and float(cache_pin_ttl_s or 0.0) > 0.0
+                )
             row = {
                 "ts": time.time(),
                 "event": event,
@@ -2094,7 +2107,10 @@ class Scheduler(
                     getattr(req, "cached_tokens", 0)
                 ),
                 "cache_priority": float(getattr(req, "cache_priority", 0.0) or 0.0),
-                "cache_pin_alive": bool(expires_at and expires_at > now_perf),
+                "cache_pin_alive": cache_pin_alive,
+                "cache_pin_ttl_s": cache_pin_ttl_s,
+                "cache_pin_range_count": len(cache_pin_ranges),
+                "cache_pin_range_tokens": cache_pin_range_tokens,
                 "queue_wait_s": max(0.0, now_perf - wait_entry) if wait_entry else None,
                 "max_new_tokens": int(
                     getattr(getattr(req, "sampling_params", None), "max_new_tokens", 0)

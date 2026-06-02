@@ -7,6 +7,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.managers.io_struct import StructuredRequestHints
 
 
 class FakeAllocator:
@@ -84,6 +85,70 @@ class PriorityRadixCacheTest(unittest.TestCase):
 
         stats = cache.priority_eviction_stats()
         self.assertGreater(stats["priority_protected_blocks"], 0.0)
+
+    def test_structured_hints_preserve_cache_pin_ranges(self) -> None:
+        hints = StructuredRequestHints.from_raw(
+            {
+                "priority": 3.0,
+                "cache_pin_ranges": [
+                    {
+                        "start": 1,
+                        "end": 3,
+                        "priority": 7.0,
+                        "cache_pin_ttl_ms": 1000.0,
+                        "source": "reuse",
+                    }
+                ],
+            }
+        )
+
+        self.assertIsNotNone(hints)
+        self.assertEqual(hints.cache_pin_ranges[0]["start"], 1)
+        self.assertEqual(hints.cache_pin_ranges[0]["end"], 3)
+        self.assertEqual(hints.cache_pin_ranges[0]["source"], "reuse")
+
+    def test_cache_pin_ranges_protect_only_selected_tokens(self) -> None:
+        cache, _allocator = self.make_cache()
+        now = time.monotonic()
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4, 5]),
+                priority=0.0,
+                cache_pin_expires_at=now + 10.0,
+                cache_pin_ranges=[
+                    {
+                        "start": 1,
+                        "end": 4,
+                        "priority": 5.0,
+                        "cache_pin_ttl_ms": 10000.0,
+                        "source": "reuse",
+                    }
+                ],
+            )
+        )
+
+        stats = cache.priority_eviction_stats()
+        self.assertEqual(stats["priority_protected_blocks"], 3.0)
+        self.assertEqual(stats["priority_reuse_protected_blocks"], 3.0)
+        self.assertEqual(stats["priority_request_protected_blocks"], 0.0)
+
+        cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3, 4, 9])))
+        stats = cache.priority_eviction_stats()
+        self.assertEqual(stats["reuse_after_pin_tokens"], 3.0)
+        self.assertEqual(stats["reuse_after_pin_token_rate"], 1.0)
+
+    def test_request_ttl_starts_when_inserted_into_radix_cache(self) -> None:
+        class FakeReq:
+            cache_priority = 5.0
+            cache_pin_ttl_s = 0.2
+            cache_pin_expires_at = time.monotonic() - 10.0
+
+        before_insert = time.monotonic()
+        expires_at = RadixCache._cache_pin_expires_at_for_req(FakeReq())
+
+        self.assertIsNotNone(expires_at)
+        self.assertGreater(expires_at, before_insert)
 
     def test_priority_evicts_lowest_priority_first(self) -> None:
         cache, allocator = self.make_cache()

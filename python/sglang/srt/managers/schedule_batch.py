@@ -610,9 +610,13 @@ class Req(ReqDllmMixin):
         self.routing_key = routing_key
         self.structured_hints = structured_hints
         self.cache_priority = self._cache_priority_from_structured_hints(structured_hints)
-        self.cache_pin_expires_at = self._cache_pin_expires_at_from_structured_hints(
+        self.cache_pin_ttl_s = self._cache_pin_ttl_s_from_structured_hints(
             structured_hints
         )
+        self.cache_pin_ranges = self._cache_pin_ranges_from_structured_hints(
+            structured_hints
+        )
+        self.cache_pin_expires_at = None
         self.cache_hint_prefix_key = (
             getattr(structured_hints, "prefix_key", None) if structured_hints else None
         )
@@ -852,7 +856,7 @@ class Req(ReqDllmMixin):
             return 0.0
 
     @staticmethod
-    def _cache_pin_expires_at_from_structured_hints(structured_hints) -> Optional[float]:
+    def _cache_pin_ttl_s_from_structured_hints(structured_hints) -> Optional[float]:
         if structured_hints is None:
             return None
         ttl_ms = getattr(structured_hints, "cache_pin_ttl_ms", None)
@@ -862,7 +866,49 @@ class Req(ReqDllmMixin):
             ttl_s = max(0.0, float(ttl_ms) / 1000.0)
         except (TypeError, ValueError):
             return None
-        return time.monotonic() + ttl_s
+        return ttl_s
+
+    @staticmethod
+    def _cache_pin_ranges_from_structured_hints(structured_hints) -> list[dict]:
+        if structured_hints is None:
+            return []
+        ranges = getattr(structured_hints, "cache_pin_ranges", None)
+        if not isinstance(ranges, list):
+            return []
+        cleaned = []
+        for item in ranges:
+            if not isinstance(item, dict):
+                continue
+            start = item.get("start")
+            end = item.get("end")
+            priority = item.get("priority")
+            if not isinstance(start, int) or not isinstance(end, int):
+                continue
+            if priority is None:
+                continue
+            try:
+                priority = max(0.0, float(priority))
+            except (TypeError, ValueError):
+                continue
+            if end <= start or priority <= 0.0:
+                continue
+            row = {
+                "start": max(0, start),
+                "end": max(0, end),
+                "priority": priority,
+            }
+            ttl_ms = item.get("cache_pin_ttl_ms")
+            if ttl_ms is not None:
+                try:
+                    row["cache_pin_ttl_ms"] = max(0.0, float(ttl_ms))
+                except (TypeError, ValueError):
+                    pass
+            for key in ("source", "level", "prefix_hash"):
+                value = item.get(key)
+                if isinstance(value, str) and value:
+                    row[key] = value
+            cleaned.append(row)
+        return cleaned
 
     @property
     def seqlen(self) -> int:

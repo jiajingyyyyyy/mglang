@@ -119,6 +119,7 @@ class TreeNode:
         self.priority = float(priority or 0.0)
         self.cache_pin_expires_at: Optional[float] = None
         self.cache_hint_prefix_key: Optional[str] = None
+        self.cache_pin_source: Optional[str] = None
         self.cache_hit_after_pin = 0
 
         self.id = TreeNode.counter if id is None else id
@@ -354,6 +355,11 @@ class RadixCache(BasePrefixCache):
         self.protected_but_not_reused_blocks = 0
         self.evicted_hot_prefix_count = 0
         self.reuse_after_pin_count = 0
+        self.reuse_after_pin_events = 0
+        self.reuse_after_pin_tokens = 0
+        self.reuse_after_pin_node_hits = 0
+        self.priority_protected_blocks_by_source = defaultdict(float)
+        self.priority_evicted_blocks_by_source = defaultdict(float)
         self.evictable_leaves.clear()
         self._record_all_cleared_event()
 
@@ -428,10 +434,20 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return empty_match_result()
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        value, last_node, matched_nodes = self._match_prefix_helper(self.root_node, key)
+        pinned_token_hits = 0
+        pinned_node_hits = 0
+        for matched_node in matched_nodes:
+            if matched_node.effective_priority() > 0:
+                pinned_node_hits += 1
+                pinned_token_hits += self._node_value_len(matched_node)
+                matched_node.cache_hit_after_pin += 1
         if last_node is not self.root_node and last_node.effective_priority() > 0:
-            last_node.cache_hit_after_pin += 1
             self.reuse_after_pin_count += 1
+        if pinned_token_hits > 0:
+            self.reuse_after_pin_events += 1
+            self.reuse_after_pin_tokens += pinned_token_hits
+            self.reuse_after_pin_node_hits += pinned_node_hits
         if value:
             value = torch.cat(value)
         else:
@@ -462,8 +478,29 @@ class RadixCache(BasePrefixCache):
             priority,
             params.cache_pin_expires_at,
             params.cache_hint_prefix_key,
+            params.cache_pin_ranges,
         )
         return InsertResult(prefix_len=prefix_len)
+
+    @staticmethod
+    def _cache_pin_expires_at_for_req(req: Req) -> Optional[float]:
+        ttl_s = getattr(req, "cache_pin_ttl_s", None)
+        priority = getattr(req, "cache_priority", 0.0) or 0.0
+        if priority > 0.0 and ttl_s is not None:
+            try:
+                ttl_s = max(0.0, float(ttl_s))
+            except (TypeError, ValueError):
+                ttl_s = 0.0
+            if ttl_s > 0.0:
+                return time.monotonic() + ttl_s
+        return getattr(req, "cache_pin_expires_at", None)
+
+    @staticmethod
+    def _cache_pin_ranges_for_req(req: Req) -> list[dict[str, Any]]:
+        ranges = getattr(req, "cache_pin_ranges", None)
+        if not isinstance(ranges, list):
+            return []
+        return [row for row in ranges if isinstance(row, dict)]
 
     def _page_align_keys(self, key: list) -> list:
         if self.page_size == 1:
@@ -499,13 +536,15 @@ class RadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "cache_priority", 0.0) or 0.0
+            cache_pin_ranges = self._cache_pin_ranges_for_req(req)
             result = self.insert(
                 InsertParams(
                     key=radix_key,
                     value=values,
-                    priority=priority,
-                    cache_pin_expires_at=getattr(req, "cache_pin_expires_at", None),
+                    priority=0.0 if cache_pin_ranges else priority,
+                    cache_pin_expires_at=self._cache_pin_expires_at_for_req(req),
                     cache_hint_prefix_key=getattr(req, "cache_hint_prefix_key", None),
+                    cache_pin_ranges=cache_pin_ranges,
                 )
             )
             new_prefix_len = result.prefix_len
@@ -546,9 +585,14 @@ class RadixCache(BasePrefixCache):
                 key=radix_key,
                 value=values,
                 chunked=chunked,
-                priority=getattr(req, "cache_priority", 0.0) or 0.0,
-                cache_pin_expires_at=getattr(req, "cache_pin_expires_at", None),
+                priority=(
+                    0.0
+                    if self._cache_pin_ranges_for_req(req)
+                    else getattr(req, "cache_priority", 0.0) or 0.0
+                ),
+                cache_pin_expires_at=self._cache_pin_expires_at_for_req(req),
                 cache_hint_prefix_key=getattr(req, "cache_hint_prefix_key", None),
+                cache_pin_ranges=self._cache_pin_ranges_for_req(req),
             )
         )
         new_prefix_len = result.prefix_len
@@ -614,10 +658,12 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
             if x.priority > 0:
+                source = str(getattr(x, "cache_pin_source", None) or "request")
                 if x.effective_priority() <= 0:
                     self.priority_expired_blocks += len(x.value)
                 else:
                     self.priority_evicted_blocks += len(x.value)
+                    self.priority_evicted_blocks_by_source[source] += len(x.value)
                     self.evicted_hot_prefix_count += 1
                 if x.cache_hit_after_pin <= 0:
                     self.protected_but_not_reused_blocks += len(x.value)
@@ -678,6 +724,8 @@ class RadixCache(BasePrefixCache):
 
     def priority_eviction_stats(self) -> dict[str, float]:
         total_protected = float(self.priority_protected_blocks or 0)
+        source_protected = dict(self.priority_protected_blocks_by_source)
+        source_evicted = dict(self.priority_evicted_blocks_by_source)
         return {
             "protected_but_not_reused_blocks": float(self.protected_but_not_reused_blocks),
             "evicted_hot_prefix_count": float(self.evicted_hot_prefix_count),
@@ -687,9 +735,25 @@ class RadixCache(BasePrefixCache):
                 else 0.0
             ),
             "reuse_after_pin_count": float(self.reuse_after_pin_count),
+            "reuse_after_pin_events": float(self.reuse_after_pin_events),
+            "reuse_after_pin_tokens": float(self.reuse_after_pin_tokens),
+            "reuse_after_pin_node_hits": float(self.reuse_after_pin_node_hits),
+            "reuse_after_pin_token_rate": (
+                float(self.reuse_after_pin_tokens) / total_protected
+                if total_protected > 0.0
+                else 0.0
+            ),
             "priority_protected_blocks": total_protected,
             "priority_expired_blocks": float(self.priority_expired_blocks),
             "priority_evicted_blocks": float(self.priority_evicted_blocks),
+            "priority_request_protected_blocks": float(source_protected.get("request", 0.0)),
+            "priority_reuse_protected_blocks": float(source_protected.get("reuse", 0.0)),
+            "priority_release_protected_blocks": float(source_protected.get("release", 0.0)),
+            "priority_range_protected_blocks": float(source_protected.get("range", 0.0)),
+            "priority_request_evicted_blocks": float(source_evicted.get("request", 0.0)),
+            "priority_reuse_evicted_blocks": float(source_evicted.get("reuse", 0.0)),
+            "priority_release_evicted_blocks": float(source_evicted.get("release", 0.0)),
+            "priority_range_evicted_blocks": float(source_evicted.get("range", 0.0)),
         }
 
     def available_and_evictable_str(self) -> str:
@@ -722,6 +786,7 @@ class RadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         value = []
+        matched_nodes = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
@@ -729,17 +794,19 @@ class RadixCache(BasePrefixCache):
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
+                matched_nodes.append(new_node)
                 node = new_node
                 break
             else:
                 value.append(child.value)
+                matched_nodes.append(child)
                 node = child
                 key = key[prefix_len:]
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
 
-        return value, node
+        return value, node, matched_nodes
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # new_node -> child
@@ -747,6 +814,7 @@ class RadixCache(BasePrefixCache):
         new_node = TreeNode(priority=child.priority)
         new_node.cache_pin_expires_at = child.cache_pin_expires_at
         new_node.cache_hint_prefix_key = child.cache_hint_prefix_key
+        new_node.cache_pin_source = child.cache_pin_source
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -770,6 +838,7 @@ class RadixCache(BasePrefixCache):
         priority: float,
         cache_pin_expires_at: Optional[float],
         cache_hint_prefix_key: Optional[str],
+        cache_pin_source: str = "request",
     ):
         priority = max(0.0, float(priority or 0.0))
         if priority <= 0.0:
@@ -777,10 +846,117 @@ class RadixCache(BasePrefixCache):
         existing_active = node.effective_priority() > 0.0
         if not existing_active or priority >= node.effective_priority():
             if node.effective_priority() <= 0.0:
-                self.priority_protected_blocks += self._node_value_len(node)
+                node_tokens = self._node_value_len(node)
+                self.priority_protected_blocks += node_tokens
+                self.priority_protected_blocks_by_source[cache_pin_source] += node_tokens
             node.priority = priority
             node.cache_pin_expires_at = cache_pin_expires_at
             node.cache_hint_prefix_key = cache_hint_prefix_key
+            node.cache_pin_source = cache_pin_source
+
+    def _normalize_cache_pin_ranges(
+        self,
+        ranges: list[dict[str, Any]],
+        key_len: int,
+        fallback_expires_at: Optional[float],
+    ) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        cleaned = []
+        for item in ranges:
+            try:
+                start = int(item.get("start", 0))
+                end = int(item.get("end", 0))
+                priority = max(0.0, float(item.get("priority", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                continue
+            start = max(0, min(key_len, start))
+            end = max(0, min(key_len, end))
+            if self.page_size != 1:
+                start = start // self.page_size * self.page_size
+                end = end // self.page_size * self.page_size
+            if end <= start or priority <= 0.0:
+                continue
+            expires_at = fallback_expires_at
+            ttl_ms = item.get("cache_pin_ttl_ms")
+            if ttl_ms is not None:
+                try:
+                    ttl_s = max(0.0, float(ttl_ms) / 1000.0)
+                except (TypeError, ValueError):
+                    ttl_s = 0.0
+                expires_at = now + ttl_s if ttl_s > 0.0 else None
+            if expires_at is not None and expires_at <= now:
+                continue
+            cleaned.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "priority": priority,
+                    "expires_at": expires_at,
+                    "source": str(item.get("source") or "range"),
+                }
+            )
+        return cleaned
+
+    def _split_key_at_boundary(self, key: RadixKey, boundary: int) -> None:
+        if boundary <= 0 or boundary >= len(key):
+            return
+        self._match_prefix_helper(self.root_node, key[:boundary])
+
+    def _iter_nodes_for_key(self, key: RadixKey):
+        node = self.root_node
+        remaining = key
+        offset = 0
+        while len(remaining) > 0:
+            child_key = self.get_child_key_fn(remaining)
+            child = node.children.get(child_key)
+            if child is None:
+                break
+            prefix_len = self.key_match_fn(child.key, remaining)
+            if prefix_len <= 0:
+                break
+            yield child, offset, offset + prefix_len
+            node = child
+            remaining = remaining[prefix_len:]
+            offset += prefix_len
+
+    def _apply_priority_ranges(
+        self,
+        key: RadixKey,
+        ranges: list[dict[str, Any]],
+        fallback_expires_at: Optional[float],
+        cache_hint_prefix_key: Optional[str],
+    ) -> None:
+        cleaned = self._normalize_cache_pin_ranges(
+            ranges, len(key), fallback_expires_at
+        )
+        if not cleaned:
+            return
+        boundaries = sorted(
+            {
+                boundary
+                for item in cleaned
+                for boundary in (item["start"], item["end"])
+                if 0 < boundary < len(key)
+            }
+        )
+        for boundary in boundaries:
+            self._split_key_at_boundary(key, boundary)
+
+        for node, start, end in self._iter_nodes_for_key(key):
+            best = None
+            for item in cleaned:
+                if item["start"] <= start and end <= item["end"]:
+                    if best is None or item["priority"] > best["priority"]:
+                        best = item
+            if best is None:
+                continue
+            self._apply_priority_hint(
+                node,
+                best["priority"],
+                best["expires_at"],
+                cache_hint_prefix_key,
+                cache_pin_source=best["source"],
+            )
 
     @staticmethod
     def _node_value_len(node: TreeNode) -> int:
@@ -800,10 +976,12 @@ class RadixCache(BasePrefixCache):
         priority: float = 0.0,
         cache_pin_expires_at: Optional[float] = None,
         cache_hint_prefix_key: Optional[str] = None,
+        cache_pin_ranges: Optional[list[dict[str, Any]]] = None,
     ):
         # Convert None priority to 0
         if priority is None:
             priority = 0.0
+        original_key = key
         access_time = time.monotonic()
         node.last_access_time = access_time
         # Update priority along the path so shared ancestors are protected too.
@@ -840,17 +1018,27 @@ class RadixCache(BasePrefixCache):
             new_node = TreeNode(priority=priority)
             new_node.cache_pin_expires_at = cache_pin_expires_at
             new_node.cache_hint_prefix_key = cache_hint_prefix_key
+            new_node.cache_pin_source = "request" if priority > 0.0 else None
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
             if new_node.effective_priority() > 0.0:
-                self.priority_protected_blocks += self._node_value_len(new_node)
+                node_tokens = self._node_value_len(new_node)
+                self.priority_protected_blocks += node_tokens
+                self.priority_protected_blocks_by_source["request"] += node_tokens
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
+        if cache_pin_ranges:
+            self._apply_priority_ranges(
+                original_key,
+                cache_pin_ranges,
+                fallback_expires_at=cache_pin_expires_at,
+                cache_hint_prefix_key=cache_hint_prefix_key,
+            )
         return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):

@@ -173,6 +173,7 @@ class StructuredRequestHints:
     task_id: Optional[str] = None
     prompt_prefix_hash: Optional[str] = None
     prefix_ladder: Optional[List[Dict[str, Any]]] = None
+    cache_pin_ranges: Optional[List[Dict[str, Any]]] = None
     latest_start_ms: Optional[float] = None
     internal_latest_start_ms: Optional[float] = None
     downstream_release_credit: Optional[Dict[str, Any]] = None
@@ -259,6 +260,45 @@ class StructuredRequestHints:
                 )
             if clean_ladder:
                 values["prefix_ladder"] = clean_ladder
+        cache_pin_ranges = raw.get("cache_pin_ranges")
+        if isinstance(cache_pin_ranges, list):
+            clean_ranges: List[Dict[str, Any]] = []
+            for raw_entry in cache_pin_ranges:
+                if not isinstance(raw_entry, Mapping):
+                    continue
+                start = raw_entry.get("start")
+                end = raw_entry.get("end")
+                priority = raw_entry.get("priority")
+                ttl_ms = raw_entry.get("cache_pin_ttl_ms")
+                if not isinstance(start, (int, float)) or isinstance(start, bool):
+                    continue
+                if not isinstance(end, (int, float)) or isinstance(end, bool):
+                    continue
+                if not isinstance(priority, (int, float)) or isinstance(priority, bool):
+                    continue
+                if ttl_ms is not None and (
+                    not isinstance(ttl_ms, (int, float)) or isinstance(ttl_ms, bool)
+                ):
+                    continue
+                start_i = max(0, int(start))
+                end_i = max(0, int(end))
+                priority_f = max(0.0, float(priority))
+                if end_i <= start_i or priority_f <= 0.0:
+                    continue
+                clean_entry: Dict[str, Any] = {
+                    "start": start_i,
+                    "end": end_i,
+                    "priority": priority_f,
+                }
+                if ttl_ms is not None:
+                    clean_entry["cache_pin_ttl_ms"] = max(0.0, float(ttl_ms))
+                for key in ("source", "level", "prefix_hash"):
+                    value = raw_entry.get(key)
+                    if isinstance(value, str) and value:
+                        clean_entry[key] = value
+                clean_ranges.append(clean_entry)
+            if clean_ranges:
+                values["cache_pin_ranges"] = clean_ranges
         release_credit = cls._clean_downstream_release_credit(
             raw.get("downstream_release_credit")
         )
