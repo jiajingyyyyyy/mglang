@@ -330,53 +330,6 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(prefix_len, 0)
         self.assertEqual(cache.total_size(), 3)
 
-    def test_insert_with_layered_pin_ranges_splits_static_and_dynamic(self):
-        """Layered pin ranges should protect only the requested token span."""
-        cache = RadixCache.create_simulated()
-        result = cache.insert(
-            InsertParams(
-                key=RadixKey([1, 2, 3, 4, 5, 6]),
-                value=torch.tensor([10, 20, 30, 40, 50, 60], dtype=torch.int64),
-                priority=99.0,
-                cache_pin_ranges=[
-                    {
-                        "start": 0,
-                        "end": 4,
-                        "priority": 7.0,
-                        "cache_pin_expires_at": time.monotonic() + 10,
-                        "cache_hint_prefix_key": "static-prefix",
-                    }
-                ],
-            )
-        )
-
-        self.assertEqual(result.prefix_len, 0)
-        self.assertEqual(len(cache.root_node.children), 1)
-        static_node = next(iter(cache.root_node.children.values()))
-        self.assertEqual(len(static_node.key), 4)
-        self.assertEqual(static_node.priority, 7.0)
-        self.assertEqual(static_node.cache_hint_prefix_key, "static-prefix")
-        dynamic_node = next(iter(static_node.children.values()))
-        self.assertEqual(len(dynamic_node.key), 2)
-        self.assertEqual(dynamic_node.priority, 0.0)
-
-    def test_insert_request_level_priority_keeps_old_whole_path_behavior(self):
-        cache = RadixCache.create_simulated()
-        cache.insert(
-            InsertParams(
-                key=RadixKey([1, 2, 3, 4]),
-                value=torch.tensor([10, 20, 30, 40], dtype=torch.int64),
-                priority=5.0,
-                cache_pin_expires_at=time.monotonic() + 10,
-                cache_hint_prefix_key="request-prefix",
-            )
-        )
-
-        node = next(iter(cache.root_node.children.values()))
-        self.assertEqual(len(node.key), 4)
-        self.assertEqual(node.priority, 5.0)
-        self.assertEqual(node.cache_hint_prefix_key, "request-prefix")
-
     def test_total_size(self):
         """Test total_size calculation."""
         cache = RadixCache.create_simulated()

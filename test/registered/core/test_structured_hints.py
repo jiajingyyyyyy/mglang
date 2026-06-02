@@ -88,42 +88,6 @@ class TestStructuredRequestHints(unittest.TestCase):
             },
         )
 
-    def test_layered_cache_pin_ranges_are_normalized(self):
-        hints = StructuredRequestHints.from_raw(
-            {
-                "cache_pin_mode": "layered_static",
-                "cache_pin_ranges": [
-                    {
-                        "start": 0,
-                        "end": 32,
-                        "priority": 4.5,
-                        "cache_pin_ttl_ms": 500,
-                        "level": "global",
-                        "source": "reuse",
-                        "prefix_hash": "abc",
-                    },
-                    {"start": 8, "end": 8, "priority": 1.0},
-                    {"start": 32, "end": 64, "priority": "high"},
-                ],
-            }
-        )
-
-        self.assertEqual(hints.cache_pin_mode, "layered_static")
-        self.assertEqual(
-            hints.cache_pin_ranges,
-            [
-                {
-                    "start": 0,
-                    "end": 32,
-                    "priority": 4.5,
-                    "level": "global",
-                    "source": "reuse",
-                    "cache_pin_ttl_ms": 500.0,
-                    "prefix_hash": "abc",
-                }
-            ],
-        )
-
     def test_generate_req_input_expands_hints_for_batch(self):
         request = GenerateReqInput(
             text=["a", "b"],
