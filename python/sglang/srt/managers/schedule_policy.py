@@ -66,11 +66,48 @@ MPLS_BRIDGE_RELEASE_WEIGHT = float(
 MPLS_DFS_OVERLAY_GAIN_SCALE_MS = float(
     os.environ.get("SGLANG_MPLS_DFS_OVERLAY_GAIN_SCALE_MS", "1000.0")
 )
+MPLS_DFS_LOSS_SCALE_MS = float(
+    os.environ.get(
+        "SGLANG_MPLS_DFS_LOSS_SCALE_MS",
+        os.environ.get("SGLANG_MPLS_DFS_OVERLAY_GAIN_SCALE_MS", "1000.0"),
+    )
+)
+MPLS_DFS_LOSS_ALPHA = float(os.environ.get("SGLANG_MPLS_DFS_LOSS_ALPHA", "1.0"))
 MPLS_DFS_OVERLAY_MAX_BONUS = float(
     os.environ.get("SGLANG_MPLS_DFS_OVERLAY_MAX_BONUS", "0.49")
 )
 MPLS_DFS_OVERLAY_OPPORTUNITY_COST = get_bool_env_var(
     "SGLANG_MPLS_DFS_OVERLAY_OPPORTUNITY_COST"
+)
+MPLS_DFS_OVERLAY_OPPORTUNITY_MODE = os.environ.get(
+    "SGLANG_MPLS_DFS_OVERLAY_OPPORTUNITY_MODE", "continuous"
+).strip().lower()
+MPLS_DFS_OVERLAY_POSITIVE_LOSS_MIN_RATIO = float(
+    os.environ.get("SGLANG_MPLS_DFS_OVERLAY_POSITIVE_LOSS_MIN_RATIO", "4.0")
+)
+MPLS_DFS_APPROX_ZERO_LOSS_MS = float(
+    os.environ.get("SGLANG_MPLS_DFS_APPROX_ZERO_LOSS_MS", "0.0")
+)
+MPLS_DFS_OVERLAY_ZERO_LOSS_MAX_BONUS = float(
+    os.environ.get(
+        "SGLANG_MPLS_DFS_OVERLAY_ZERO_LOSS_MAX_BONUS",
+        os.environ.get("SGLANG_MPLS_DFS_OVERLAY_MAX_BONUS", "0.49"),
+    )
+)
+MPLS_DFS_OVERLAY_APPROX_ZERO_LOSS_MAX_BONUS = float(
+    os.environ.get(
+        "SGLANG_MPLS_DFS_OVERLAY_APPROX_ZERO_LOSS_MAX_BONUS",
+        os.environ.get(
+            "SGLANG_MPLS_DFS_OVERLAY_ZERO_LOSS_MAX_BONUS",
+            os.environ.get("SGLANG_MPLS_DFS_OVERLAY_MAX_BONUS", "0.49"),
+        ),
+    )
+)
+MPLS_DFS_OVERLAY_POSITIVE_LOSS_MAX_BONUS = float(
+    os.environ.get(
+        "SGLANG_MPLS_DFS_OVERLAY_POSITIVE_LOSS_MAX_BONUS",
+        os.environ.get("SGLANG_MPLS_DFS_OVERLAY_MAX_BONUS", "0.49"),
+    )
 )
 MPLS_DFS_OVERLAY_TARGET = os.environ.get(
     "SGLANG_MPLS_DFS_OVERLAY_TARGET", "upstream"
@@ -595,6 +632,8 @@ class SchedulePolicy:
         req_to_overlay = {}
 
         gain_scale_ms = max(1e-6, float(MPLS_DFS_OVERLAY_GAIN_SCALE_MS or 0.0))
+        loss_scale_ms = max(0.0, float(MPLS_DFS_LOSS_SCALE_MS or 0.0))
+        loss_alpha = max(0.0, float(MPLS_DFS_LOSS_ALPHA or 0.0))
         for req in waiting_queue:
             last_node_to_reqs[req.last_node].append(req)
             node_to_weight[req.last_node] += 1
@@ -618,17 +657,31 @@ class SchedulePolicy:
                 * max(0.0, direct_release_gain),
             )
 
-            current_dfs_loss = 0.0
+            current_dfs_loss = SchedulePolicy._mpls_current_dfs_loss_ms(
+                req.last_node,
+                node_to_dfs_weight,
+                loss_scale_ms,
+            )
             opportunity_net_gain = total_gain
             overlay_gain = total_gain
+            approx_zero_loss = current_dfs_loss <= max(
+                0.0, MPLS_DFS_APPROX_ZERO_LOSS_MS
+            )
             if MPLS_DFS_OVERLAY_OPPORTUNITY_COST:
-                current_dfs_loss = SchedulePolicy._mpls_current_dfs_loss_ms(
-                    req.last_node,
-                    node_to_dfs_weight,
-                    gain_scale_ms,
-                )
-                opportunity_net_gain = total_gain - current_dfs_loss
-                overlay_gain = total_gain if opportunity_net_gain > 0.0 else 0.0
+                opportunity_net_gain = total_gain - loss_alpha * current_dfs_loss
+                if MPLS_DFS_OVERLAY_OPPORTUNITY_MODE == "ratio_gate":
+                    if approx_zero_loss:
+                        overlay_gain = total_gain
+                    elif total_gain / current_dfs_loss >= max(
+                        0.0, MPLS_DFS_OVERLAY_POSITIVE_LOSS_MIN_RATIO
+                    ):
+                        overlay_gain = total_gain
+                    else:
+                        overlay_gain = 0.0
+                elif MPLS_DFS_OVERLAY_OPPORTUNITY_MODE == "hard_gate":
+                    overlay_gain = total_gain if opportunity_net_gain > 0.0 else 0.0
+                else:
+                    overlay_gain = max(0.0, opportunity_net_gain)
 
             if overlay_gain > 0.0:
                 any_positive_overlay = True
@@ -641,9 +694,27 @@ class SchedulePolicy:
                 target_nodes = bridge_info.get("matched_nodes")
             if not isinstance(target_nodes, set) or not target_nodes:
                 target_nodes = {req.last_node}
-            per_node_overlay = (overlay_gain / gain_scale_ms) / max(
-                1, len(target_nodes)
-            )
+            overlay_units = overlay_gain / gain_scale_ms
+            if (
+                MPLS_DFS_OVERLAY_OPPORTUNITY_COST
+                and MPLS_DFS_OVERLAY_OPPORTUNITY_MODE == "ratio_gate"
+            ):
+                if current_dfs_loss <= 0.0:
+                    overlay_units = min(
+                        max(0.0, MPLS_DFS_OVERLAY_ZERO_LOSS_MAX_BONUS),
+                        overlay_units,
+                    )
+                elif approx_zero_loss:
+                    overlay_units = min(
+                        max(0.0, MPLS_DFS_OVERLAY_APPROX_ZERO_LOSS_MAX_BONUS),
+                        overlay_units,
+                    )
+                else:
+                    overlay_units = min(
+                        max(0.0, MPLS_DFS_OVERLAY_POSITIVE_LOSS_MAX_BONUS),
+                        overlay_units,
+                    )
+            per_node_overlay = overlay_units / max(1, len(target_nodes))
             for node in target_nodes:
                 node_to_overlay[node] += per_node_overlay
             req_to_overlay[id(req)] = {
@@ -653,6 +724,7 @@ class SchedulePolicy:
                 "direct_release_gain_ms": direct_release_gain,
                 "current_dfs_loss_ms": current_dfs_loss,
                 "opportunity_net_gain_ms": opportunity_net_gain,
+                "approx_zero_loss_count": 1.0 if approx_zero_loss else 0.0,
                 "opportunity_accepted_count": (
                     1.0
                     if MPLS_DFS_OVERLAY_OPPORTUNITY_COST and overlay_gain > 0.0
@@ -708,6 +780,10 @@ class SchedulePolicy:
             mpls_stats["opportunity_rejected_count_total"] += sum(
                 info["opportunity_rejected_count"] for info in req_to_overlay.values()
             )
+            for info in req_to_overlay.values():
+                SchedulePolicy._record_mpls_gain_loss_diagnostics(
+                    mpls_stats, "bridge_candidate", info
+                )
             if any_positive_overlay:
                 mpls_stats["overlay_positive_count"] += 1
             else:
@@ -769,6 +845,9 @@ class SchedulePolicy:
             mpls_stats["selected_opportunity_accepted_count_total"] += float(
                 selected_info.get("opportunity_accepted_count") or 0.0
             )
+            SchedulePolicy._record_mpls_gain_loss_diagnostics(
+                mpls_stats, "selected_bridge_candidate", selected_info
+            )
             if float(selected_info.get("future_ladder_entry_count") or 0.0) > 0.0:
                 mpls_stats["selected_with_future_ladder_count"] += 1
             if float(selected_info.get("future_ladder_match_count") or 0.0) > 0.0:
@@ -819,6 +898,67 @@ class SchedulePolicy:
             child = parent
             parent = getattr(child, "parent", None)
         return max(0.0, max_deficit_units) * gain_scale_ms
+
+    @staticmethod
+    def _record_mpls_gain_loss_diagnostics(
+        mpls_stats: Dict[str, float],
+        prefix: str,
+        info: dict,
+    ) -> None:
+        future_gain = max(0.0, float(info.get("bridge_release_gain_ms") or 0.0))
+        if future_gain <= 0.0:
+            return
+        dfs_loss = max(0.0, float(info.get("current_dfs_loss_ms") or 0.0))
+        net_gain = float(info.get("opportunity_net_gain_ms") or future_gain)
+        base = f"{prefix}_"
+        mpls_stats[f"{base}count_total"] += 1.0
+        mpls_stats[f"{base}future_gain_ms_total"] += future_gain
+        mpls_stats[f"{base}dfs_loss_ms_total"] += dfs_loss
+        mpls_stats[f"{base}net_gain_ms_total"] += net_gain
+        mpls_stats[f"{base}future_gain_ms_max"] = max(
+            float(mpls_stats.get(f"{base}future_gain_ms_max") or 0.0),
+            future_gain,
+        )
+        mpls_stats[f"{base}dfs_loss_ms_max"] = max(
+            float(mpls_stats.get(f"{base}dfs_loss_ms_max") or 0.0),
+            dfs_loss,
+        )
+        if dfs_loss <= 0.0:
+            mpls_stats[f"{base}zero_loss_count_total"] += 1.0
+            mpls_stats[f"{base}ratio_inf_count_total"] += 1.0
+        if float(info.get("approx_zero_loss_count") or 0.0) > 0.0:
+            mpls_stats[f"{base}approx_zero_loss_count_total"] += 1.0
+        if dfs_loss > 0.0:
+            mpls_stats[f"{base}positive_loss_count_total"] += 1.0
+            ratio = future_gain / dfs_loss
+            if ratio >= 1.0:
+                mpls_stats[f"{base}ratio_ge_1_count_total"] += 1.0
+            if ratio >= 2.0:
+                mpls_stats[f"{base}ratio_ge_2_count_total"] += 1.0
+            if ratio >= 4.0:
+                mpls_stats[f"{base}ratio_ge_4_count_total"] += 1.0
+        if future_gain <= 50.0:
+            mpls_stats[f"{base}future_gain_le_50_count_total"] += 1.0
+        elif future_gain <= 100.0:
+            mpls_stats[f"{base}future_gain_le_100_count_total"] += 1.0
+        elif future_gain <= 300.0:
+            mpls_stats[f"{base}future_gain_le_300_count_total"] += 1.0
+        elif future_gain <= 1000.0:
+            mpls_stats[f"{base}future_gain_le_1000_count_total"] += 1.0
+        else:
+            mpls_stats[f"{base}future_gain_gt_1000_count_total"] += 1.0
+        if dfs_loss <= 0.0:
+            mpls_stats[f"{base}dfs_loss_zero_count_total"] += 1.0
+        elif dfs_loss <= 50.0:
+            mpls_stats[f"{base}dfs_loss_le_50_count_total"] += 1.0
+        elif dfs_loss <= 100.0:
+            mpls_stats[f"{base}dfs_loss_le_100_count_total"] += 1.0
+        elif dfs_loss <= 300.0:
+            mpls_stats[f"{base}dfs_loss_le_300_count_total"] += 1.0
+        elif dfs_loss <= 1000.0:
+            mpls_stats[f"{base}dfs_loss_le_1000_count_total"] += 1.0
+        else:
+            mpls_stats[f"{base}dfs_loss_gt_1000_count_total"] += 1.0
 
     @staticmethod
     def _get_mpls_dfs_overlay_priority(
@@ -993,6 +1133,12 @@ class SchedulePolicy:
             float(stats.get("selected_opportunity_accepted_count_total") or 0.0)
             / selected_count
         )
+        SchedulePolicy._derive_mpls_gain_loss_diagnostics(
+            stats, "bridge_candidate"
+        )
+        SchedulePolicy._derive_mpls_gain_loss_diagnostics(
+            stats, "selected_bridge_candidate"
+        )
         stats["selected_normalized_lag_avg"] = (
             float(stats.get("selected_normalized_lag_total") or 0.0) / selected_count
         )
@@ -1006,6 +1152,43 @@ class SchedulePolicy:
             float(stats.get("expired_lease_count_total") or 0.0) / calls
         )
         return stats
+
+    @staticmethod
+    def _derive_mpls_gain_loss_diagnostics(stats: dict, prefix: str) -> None:
+        base = f"{prefix}_"
+        count = max(1.0, float(stats.get(f"{base}count_total") or 0.0))
+        stats[f"{base}future_gain_ms_avg"] = (
+            float(stats.get(f"{base}future_gain_ms_total") or 0.0) / count
+        )
+        stats[f"{base}dfs_loss_ms_avg"] = (
+            float(stats.get(f"{base}dfs_loss_ms_total") or 0.0) / count
+        )
+        stats[f"{base}net_gain_ms_avg"] = (
+            float(stats.get(f"{base}net_gain_ms_total") or 0.0) / count
+        )
+        for name in (
+            "zero_loss",
+            "approx_zero_loss",
+            "positive_loss",
+            "ratio_inf",
+            "ratio_ge_1",
+            "ratio_ge_2",
+            "ratio_ge_4",
+            "future_gain_le_50",
+            "future_gain_le_100",
+            "future_gain_le_300",
+            "future_gain_le_1000",
+            "future_gain_gt_1000",
+            "dfs_loss_zero",
+            "dfs_loss_le_50",
+            "dfs_loss_le_100",
+            "dfs_loss_le_300",
+            "dfs_loss_le_1000",
+            "dfs_loss_gt_1000",
+        ):
+            stats[f"{base}{name}_rate"] = (
+                float(stats.get(f"{base}{name}_count_total") or 0.0) / count
+            )
 
     @staticmethod
     def _mpls_prefix_ladder(req: Req) -> List[dict]:
