@@ -63,6 +63,24 @@ MPLS_DEFAULT_BUDGET_MS = float(os.environ.get("SGLANG_MPLS_DEFAULT_BUDGET_MS", "
 MPLS_BRIDGE_RELEASE_WEIGHT = float(
     os.environ.get("SGLANG_MPLS_BRIDGE_RELEASE_WEIGHT", "1.0")
 )
+MPLS_DFS_OVERLAY_GAIN_SCALE_MS = float(
+    os.environ.get("SGLANG_MPLS_DFS_OVERLAY_GAIN_SCALE_MS", "1000.0")
+)
+MPLS_DFS_OVERLAY_MAX_BONUS = float(
+    os.environ.get("SGLANG_MPLS_DFS_OVERLAY_MAX_BONUS", "0.49")
+)
+MPLS_DFS_OVERLAY_OPPORTUNITY_COST = get_bool_env_var(
+    "SGLANG_MPLS_DFS_OVERLAY_OPPORTUNITY_COST"
+)
+MPLS_DFS_OVERLAY_TARGET = os.environ.get(
+    "SGLANG_MPLS_DFS_OVERLAY_TARGET", "upstream"
+).strip().lower()
+MPLS_DIRECT_RELEASE_WEIGHT = float(
+    os.environ.get("SGLANG_MPLS_DIRECT_RELEASE_WEIGHT", "0.0")
+)
+MPLS_IMMINENT_UNLOCK_WEIGHT = float(
+    os.environ.get("SGLANG_MPLS_IMMINENT_UNLOCK_WEIGHT", "0.0")
+)
 logger = logging.getLogger(__name__)
 
 # Copyright 2023-2024 SGLang Team
@@ -229,6 +247,7 @@ class SchedulePolicy:
                     waiting_queue,
                     temporary_deprioritized,
                     self.mpls_stats,
+                    tree_cache=self.tree_cache,
                 )
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
@@ -361,13 +380,15 @@ class SchedulePolicy:
         waiting_queue: List[Req],
         temporary_deprioritized: Set[int],
         mpls_stats: Optional[Dict[str, float]] = None,
+        tree_cache: Optional[BasePrefixCache] = None,
     ) -> None:
-        """Sort by deadline-guarded prefix leases without external waiting.
+        """Sort by workflow-aware prefix release gains as a DFS overlay.
 
         MPLS is intentionally work-conserving here: it only reorders the
-        backend-visible waiting queue.  The selected lease is moved to the
-        front, and the normal SGLang prefill adder may continue filling the
-        batch from following requests if capacity remains.
+        backend-visible waiting queue.  In the normal server path MPLS keeps
+        DFS as the base traversal and adds workflow bridge/release gain to each
+        radix subtree's score.  The legacy lease-first path is kept only for
+        tests or unusual callers that do not provide radix nodes.
         """
         if len(waiting_queue) <= 1:
             return
@@ -376,6 +397,15 @@ class SchedulePolicy:
         if mpls_stats is not None:
             mpls_stats["calls"] += 1
             mpls_stats["waiting_req_count_total"] += len(waiting_queue)
+
+        if tree_cache is not None and all(
+            getattr(req, "last_node", None) is not None for req in waiting_queue
+        ):
+            SchedulePolicy._sort_by_mpls_dfs_overlay(
+                waiting_queue, tree_cache, mpls_stats
+            )
+            return
+
         ready_prefix_index = SchedulePolicy._mpls_ready_prefix_index(waiting_queue)
         leases: Dict[tuple, dict] = {}
         for original_index, req in enumerate(waiting_queue):
@@ -406,9 +436,9 @@ class SchedulePolicy:
 
         if not leases:
             if mpls_stats is not None:
-                mpls_stats["fallback_longest_prefix_count"] += 1
-            SchedulePolicy._sort_by_longest_prefix(
-                waiting_queue, temporary_deprioritized
+                mpls_stats["fallback_dfs_count"] += 1
+            SchedulePolicy._mpls_sort_by_base_dfs(
+                waiting_queue, tree_cache, temporary_deprioritized
             )
             return
 
@@ -424,25 +454,49 @@ class SchedulePolicy:
                 SchedulePolicy._mpls_downstream_release_gain_ms(req)
                 for _index, req in lease["reqs"]
             )
-            bridge_release_gain = sum(
-                SchedulePolicy._mpls_bridge_release_gain_ms(req, ready_prefix_index)
+            bridge_infos = [
+                SchedulePolicy._mpls_bridge_release_gain_info(req, ready_prefix_index)
                 for _index, req in lease["reqs"]
+            ]
+            imminent_infos = [
+                SchedulePolicy._mpls_imminent_unlock_gain_info(req, bridge_info)
+                for (_index, req), bridge_info in zip(lease["reqs"], bridge_infos)
+            ]
+            bridge_release_gain = sum(info["gain_ms"] for info in bridge_infos)
+            imminent_unlock_gain = sum(info["gain_ms"] for info in imminent_infos)
+            future_entry_count = sum(info["future_entry_count"] for info in bridge_infos)
+            future_match_count = sum(info["matched_entry_count"] for info in bridge_infos)
+            bridge_ready_match_count = sum(
+                info["ready_match_count"] for info in bridge_infos
             )
-            release_gain = direct_release_gain + bridge_release_gain
+            bridge_hit_req_count = sum(1 for info in bridge_infos if info["gain_ms"] > 0)
+            imminent_unlock_req_count = sum(
+                1 for info in imminent_infos if info["gain_ms"] > 0
+            )
+            release_gain = direct_release_gain + bridge_release_gain + imminent_unlock_gain
             total_gain = prefix_gain + release_gain
             lease["normalized_lag"] = normalized_lag
             lease["prefix_gain"] = prefix_gain
             lease["prefix_gain_ms"] = prefix_gain
             lease["release_gain_ms"] = release_gain
             lease["bridge_release_gain_ms"] = bridge_release_gain
+            lease["imminent_unlock_gain_ms"] = imminent_unlock_gain
+            lease["future_ladder_req_count"] = sum(
+                1 for info in bridge_infos if info["future_entry_count"] > 0
+            )
+            lease["future_ladder_entry_count"] = future_entry_count
+            lease["future_ladder_match_count"] = future_match_count
+            lease["bridge_ready_match_count"] = bridge_ready_match_count
+            lease["bridge_hit_req_count"] = bridge_hit_req_count
+            lease["imminent_unlock_req_count"] = imminent_unlock_req_count
             lease["total_gain_ms"] = total_gain
             scored_leases.append(lease)
 
         if not scored_leases:
             if mpls_stats is not None:
-                mpls_stats["fallback_longest_prefix_count"] += 1
-            SchedulePolicy._sort_by_longest_prefix(
-                waiting_queue, temporary_deprioritized
+                mpls_stats["fallback_dfs_count"] += 1
+            SchedulePolicy._mpls_sort_by_base_dfs(
+                waiting_queue, tree_cache, temporary_deprioritized
             )
             return
 
@@ -450,6 +504,34 @@ class SchedulePolicy:
         if mpls_stats is not None:
             mpls_stats["active_lease_count_total"] += len(scored_leases)
             mpls_stats["expired_lease_count_total"] += len(expired)
+            mpls_stats["future_ladder_req_count_total"] += sum(
+                float(lease.get("future_ladder_req_count") or 0.0)
+                for lease in scored_leases
+            )
+            mpls_stats["future_ladder_entry_count_total"] += sum(
+                float(lease.get("future_ladder_entry_count") or 0.0)
+                for lease in scored_leases
+            )
+            mpls_stats["future_ladder_match_count_total"] += sum(
+                float(lease.get("future_ladder_match_count") or 0.0)
+                for lease in scored_leases
+            )
+            mpls_stats["bridge_ready_match_count_total"] += sum(
+                float(lease.get("bridge_ready_match_count") or 0.0)
+                for lease in scored_leases
+            )
+            mpls_stats["bridge_hit_req_count_total"] += sum(
+                float(lease.get("bridge_hit_req_count") or 0.0)
+                for lease in scored_leases
+            )
+            mpls_stats["imminent_unlock_req_count_total"] += sum(
+                float(lease.get("imminent_unlock_req_count") or 0.0)
+                for lease in scored_leases
+            )
+            mpls_stats["imminent_unlock_gain_ms_total"] += sum(
+                float(lease.get("imminent_unlock_gain_ms") or 0.0)
+                for lease in scored_leases
+            )
         if expired:
             selected = min(
                 expired,
@@ -474,9 +556,9 @@ class SchedulePolicy:
             selected_expired = False
             if selected["total_gain_ms"] <= 0:
                 if mpls_stats is not None:
-                    mpls_stats["fallback_longest_prefix_count"] += 1
-                SchedulePolicy._sort_by_longest_prefix(
-                    waiting_queue, temporary_deprioritized
+                    mpls_stats["fallback_dfs_count"] += 1
+                SchedulePolicy._mpls_sort_by_base_dfs(
+                    waiting_queue, tree_cache, temporary_deprioritized
                 )
                 return
 
@@ -490,12 +572,294 @@ class SchedulePolicy:
             )
         )
         rest = [req for req in waiting_queue if id(req) not in selected_ids]
-        SchedulePolicy._sort_by_longest_prefix(rest, temporary_deprioritized)
+        SchedulePolicy._mpls_sort_by_base_dfs(
+            rest, tree_cache, temporary_deprioritized
+        )
         waiting_queue[:] = selected_reqs + rest
         if mpls_stats is not None:
             SchedulePolicy._record_mpls_selection(
                 mpls_stats, selected, selected_reqs, selected_expired
             )
+
+    @staticmethod
+    def _sort_by_mpls_dfs_overlay(
+        waiting_queue: List[Req],
+        tree_cache: BasePrefixCache,
+        mpls_stats: Optional[Dict[str, float]] = None,
+    ) -> None:
+        ready_prefix_index = SchedulePolicy._mpls_ready_prefix_index(waiting_queue)
+        last_node_to_reqs = defaultdict(list)
+        node_to_weight = defaultdict(int)
+        node_to_overlay = defaultdict(float)
+        node_to_score = defaultdict(float)
+        req_to_overlay = {}
+
+        gain_scale_ms = max(1e-6, float(MPLS_DFS_OVERLAY_GAIN_SCALE_MS or 0.0))
+        for req in waiting_queue:
+            last_node_to_reqs[req.last_node].append(req)
+            node_to_weight[req.last_node] += 1
+
+        node_to_dfs_weight = defaultdict(int)
+        for node, weight in node_to_weight.items():
+            node_to_dfs_weight[node] = weight
+        SchedulePolicy._calc_weight(tree_cache.root_node, node_to_dfs_weight)
+
+        any_positive_overlay = False
+        for req in waiting_queue:
+            direct_release_gain = SchedulePolicy._mpls_downstream_release_gain_ms(req)
+            bridge_info = SchedulePolicy._mpls_bridge_release_gain_info(
+                req, ready_prefix_index
+            )
+            bridge_gain = float(bridge_info.get("gain_ms") or 0.0)
+            total_gain = max(
+                0.0,
+                bridge_gain
+                + max(0.0, MPLS_DIRECT_RELEASE_WEIGHT)
+                * max(0.0, direct_release_gain),
+            )
+
+            current_dfs_loss = 0.0
+            opportunity_net_gain = total_gain
+            overlay_gain = total_gain
+            if MPLS_DFS_OVERLAY_OPPORTUNITY_COST:
+                current_dfs_loss = SchedulePolicy._mpls_current_dfs_loss_ms(
+                    req.last_node,
+                    node_to_dfs_weight,
+                    gain_scale_ms,
+                )
+                opportunity_net_gain = total_gain - current_dfs_loss
+                overlay_gain = total_gain if opportunity_net_gain > 0.0 else 0.0
+
+            if overlay_gain > 0.0:
+                any_positive_overlay = True
+
+            target_nodes = None
+            if (
+                not MPLS_DFS_OVERLAY_OPPORTUNITY_COST
+                and MPLS_DFS_OVERLAY_TARGET == "downstream"
+            ):
+                target_nodes = bridge_info.get("matched_nodes")
+            if not isinstance(target_nodes, set) or not target_nodes:
+                target_nodes = {req.last_node}
+            per_node_overlay = (overlay_gain / gain_scale_ms) / max(
+                1, len(target_nodes)
+            )
+            for node in target_nodes:
+                node_to_overlay[node] += per_node_overlay
+            req_to_overlay[id(req)] = {
+                "total_gain_ms": total_gain,
+                "release_gain_ms": overlay_gain,
+                "bridge_release_gain_ms": bridge_gain,
+                "direct_release_gain_ms": direct_release_gain,
+                "current_dfs_loss_ms": current_dfs_loss,
+                "opportunity_net_gain_ms": opportunity_net_gain,
+                "opportunity_accepted_count": (
+                    1.0
+                    if MPLS_DFS_OVERLAY_OPPORTUNITY_COST and overlay_gain > 0.0
+                    else 0.0
+                ),
+                "opportunity_rejected_count": (
+                    1.0
+                    if MPLS_DFS_OVERLAY_OPPORTUNITY_COST
+                    and total_gain > 0.0
+                    and overlay_gain <= 0.0
+                    else 0.0
+                ),
+                "future_ladder_entry_count": float(
+                    bridge_info.get("future_entry_count") or 0.0
+                ),
+                "future_ladder_match_count": float(
+                    bridge_info.get("matched_entry_count") or 0.0
+                ),
+                "bridge_ready_match_count": float(
+                    bridge_info.get("ready_match_count") or 0.0
+                ),
+                "bridge_hit_req_count": 1.0 if bridge_gain > 0.0 else 0.0,
+            }
+
+        if mpls_stats is not None:
+            mpls_stats["active_lease_count_total"] += len(waiting_queue)
+            mpls_stats["future_ladder_req_count_total"] += sum(
+                1.0
+                for info in req_to_overlay.values()
+                if info["future_ladder_entry_count"] > 0.0
+            )
+            mpls_stats["future_ladder_entry_count_total"] += sum(
+                info["future_ladder_entry_count"] for info in req_to_overlay.values()
+            )
+            mpls_stats["future_ladder_match_count_total"] += sum(
+                info["future_ladder_match_count"] for info in req_to_overlay.values()
+            )
+            mpls_stats["bridge_ready_match_count_total"] += sum(
+                info["bridge_ready_match_count"] for info in req_to_overlay.values()
+            )
+            mpls_stats["bridge_hit_req_count_total"] += sum(
+                info["bridge_hit_req_count"] for info in req_to_overlay.values()
+            )
+            mpls_stats["opportunity_current_dfs_loss_ms_total"] += sum(
+                info["current_dfs_loss_ms"] for info in req_to_overlay.values()
+            )
+            mpls_stats["opportunity_net_gain_ms_total"] += sum(
+                info["opportunity_net_gain_ms"] for info in req_to_overlay.values()
+            )
+            mpls_stats["opportunity_accepted_count_total"] += sum(
+                info["opportunity_accepted_count"] for info in req_to_overlay.values()
+            )
+            mpls_stats["opportunity_rejected_count_total"] += sum(
+                info["opportunity_rejected_count"] for info in req_to_overlay.values()
+            )
+            if any_positive_overlay:
+                mpls_stats["overlay_positive_count"] += 1
+            else:
+                mpls_stats["fallback_dfs_count"] += 1
+
+        SchedulePolicy._calc_mpls_dfs_overlay_score(
+            tree_cache.root_node,
+            node_to_weight,
+            node_to_overlay,
+            node_to_score,
+        )
+
+        waiting_queue.clear()
+        SchedulePolicy._get_mpls_dfs_overlay_priority(
+            tree_cache.root_node,
+            node_to_score,
+            node_to_weight,
+            last_node_to_reqs,
+            waiting_queue,
+        )
+
+        if mpls_stats is not None and waiting_queue:
+            selected_req = waiting_queue[0]
+            selected_info = req_to_overlay.get(id(selected_req), {})
+            mpls_stats["selected_count"] += 1
+            mpls_stats["selected_req_count_total"] += 1
+            mpls_stats["selected_prefix_len_total"] += float(
+                SchedulePolicy._safe_len(getattr(selected_req, "prefix_indices", None))
+            )
+            mpls_stats["selected_release_gain_ms_total"] += float(
+                selected_info.get("release_gain_ms") or 0.0
+            )
+            mpls_stats["selected_bridge_release_gain_ms_total"] += float(
+                selected_info.get("bridge_release_gain_ms") or 0.0
+            )
+            mpls_stats["selected_future_ladder_req_count_total"] += (
+                1.0
+                if float(selected_info.get("future_ladder_entry_count") or 0.0) > 0.0
+                else 0.0
+            )
+            mpls_stats["selected_future_ladder_entry_count_total"] += float(
+                selected_info.get("future_ladder_entry_count") or 0.0
+            )
+            mpls_stats["selected_future_ladder_match_count_total"] += float(
+                selected_info.get("future_ladder_match_count") or 0.0
+            )
+            mpls_stats["selected_bridge_ready_match_count_total"] += float(
+                selected_info.get("bridge_ready_match_count") or 0.0
+            )
+            mpls_stats["selected_bridge_hit_req_count_total"] += float(
+                selected_info.get("bridge_hit_req_count") or 0.0
+            )
+            mpls_stats["selected_opportunity_current_dfs_loss_ms_total"] += float(
+                selected_info.get("current_dfs_loss_ms") or 0.0
+            )
+            mpls_stats["selected_opportunity_net_gain_ms_total"] += float(
+                selected_info.get("opportunity_net_gain_ms") or 0.0
+            )
+            mpls_stats["selected_opportunity_accepted_count_total"] += float(
+                selected_info.get("opportunity_accepted_count") or 0.0
+            )
+            if float(selected_info.get("future_ladder_entry_count") or 0.0) > 0.0:
+                mpls_stats["selected_with_future_ladder_count"] += 1
+            if float(selected_info.get("future_ladder_match_count") or 0.0) > 0.0:
+                mpls_stats["selected_with_future_ladder_match_count"] += 1
+            if float(selected_info.get("bridge_release_gain_ms") or 0.0) > 0.0:
+                mpls_stats["selected_with_bridge_gain_count"] += 1
+            mpls_stats["selected_total_gain_ms_total"] += float(
+                selected_info.get("total_gain_ms") or 0.0
+            )
+
+    @staticmethod
+    def _calc_mpls_dfs_overlay_score(
+        cur_node: TreeNode,
+        node_to_weight: Dict[TreeNode, int],
+        node_to_overlay: Dict[TreeNode, float],
+        node_to_score: Dict[TreeNode, float],
+    ) -> None:
+        max_bonus = max(0.0, float(MPLS_DFS_OVERLAY_MAX_BONUS or 0.0))
+        for child in cur_node.children.values():
+            SchedulePolicy._calc_mpls_dfs_overlay_score(
+                child, node_to_weight, node_to_overlay, node_to_score
+            )
+            node_to_weight[cur_node] += node_to_weight[child]
+            node_to_overlay[cur_node] += node_to_overlay[child]
+        node_to_score[cur_node] = float(node_to_weight[cur_node]) + min(
+            max_bonus, max(0.0, float(node_to_overlay[cur_node]))
+        )
+
+    @staticmethod
+    def _mpls_current_dfs_loss_ms(
+        node: TreeNode,
+        node_to_weight: Dict[TreeNode, int],
+        gain_scale_ms: float,
+    ) -> float:
+        """Estimate the DFS locality opportunity cost of advancing this subtree."""
+        max_deficit_units = 0.0
+        child = node
+        parent = getattr(child, "parent", None)
+        while parent is not None:
+            siblings = getattr(parent, "children", {}).values()
+            if siblings:
+                child_weight = float(node_to_weight[child])
+                best_sibling_weight = max(float(node_to_weight[s]) for s in siblings)
+                max_deficit_units = max(
+                    max_deficit_units,
+                    max(0.0, best_sibling_weight - child_weight),
+                )
+            child = parent
+            parent = getattr(child, "parent", None)
+        return max(0.0, max_deficit_units) * gain_scale_ms
+
+    @staticmethod
+    def _get_mpls_dfs_overlay_priority(
+        cur_node: TreeNode,
+        node_to_score: Dict[TreeNode, float],
+        node_to_weight: Dict[TreeNode, int],
+        last_node_to_reqs: Dict[TreeNode, List[Req]],
+        q: List,
+    ) -> None:
+        children = [child for child in cur_node.children.values()]
+        children.sort(
+            key=lambda x: (
+                -node_to_score[x],
+                -node_to_weight[x],
+            )
+        )
+        for child in children:
+            SchedulePolicy._get_mpls_dfs_overlay_priority(
+                child, node_to_score, node_to_weight, last_node_to_reqs, q
+            )
+        q.extend(last_node_to_reqs[cur_node])
+
+    @staticmethod
+    def _mpls_sort_by_base_dfs(
+        waiting_queue: List[Req],
+        tree_cache: Optional[BasePrefixCache],
+        temporary_deprioritized: Set[int],
+    ) -> None:
+        if not waiting_queue:
+            return
+        if tree_cache is not None and all(
+            getattr(req, "last_node", None) is not None for req in waiting_queue
+        ):
+            try:
+                SchedulePolicy._sort_by_dfs_weight(waiting_queue, tree_cache)
+                return
+            except Exception:
+                logger.exception("MPLS DFS fallback failed; using longest-prefix order")
+        SchedulePolicy._sort_by_longest_prefix(
+            waiting_queue, temporary_deprioritized
+        )
 
     @staticmethod
     def _record_mpls_selection(
@@ -515,6 +879,35 @@ class SchedulePolicy:
         mpls_stats["selected_bridge_release_gain_ms_total"] += float(
             selected.get("bridge_release_gain_ms") or 0.0
         )
+        mpls_stats["selected_imminent_unlock_gain_ms_total"] += float(
+            selected.get("imminent_unlock_gain_ms") or 0.0
+        )
+        mpls_stats["selected_future_ladder_req_count_total"] += float(
+            selected.get("future_ladder_req_count") or 0.0
+        )
+        mpls_stats["selected_future_ladder_entry_count_total"] += float(
+            selected.get("future_ladder_entry_count") or 0.0
+        )
+        mpls_stats["selected_future_ladder_match_count_total"] += float(
+            selected.get("future_ladder_match_count") or 0.0
+        )
+        mpls_stats["selected_bridge_ready_match_count_total"] += float(
+            selected.get("bridge_ready_match_count") or 0.0
+        )
+        mpls_stats["selected_bridge_hit_req_count_total"] += float(
+            selected.get("bridge_hit_req_count") or 0.0
+        )
+        mpls_stats["selected_imminent_unlock_req_count_total"] += float(
+            selected.get("imminent_unlock_req_count") or 0.0
+        )
+        if float(selected.get("future_ladder_entry_count") or 0.0) > 0.0:
+            mpls_stats["selected_with_future_ladder_count"] += 1
+        if float(selected.get("future_ladder_match_count") or 0.0) > 0.0:
+            mpls_stats["selected_with_future_ladder_match_count"] += 1
+        if float(selected.get("bridge_release_gain_ms") or 0.0) > 0.0:
+            mpls_stats["selected_with_bridge_gain_count"] += 1
+        if float(selected.get("imminent_unlock_gain_ms") or 0.0) > 0.0:
+            mpls_stats["selected_with_imminent_unlock_count"] += 1
         mpls_stats["selected_total_gain_ms_total"] += float(
             selected.get("total_gain_ms") or 0.0
         )
@@ -540,8 +933,64 @@ class SchedulePolicy:
             float(stats.get("selected_bridge_release_gain_ms_total") or 0.0)
             / selected_count
         )
+        stats["selected_imminent_unlock_gain_ms_avg"] = (
+            float(stats.get("selected_imminent_unlock_gain_ms_total") or 0.0)
+            / selected_count
+        )
+        stats["imminent_unlock_gain_ms_avg"] = (
+            float(stats.get("imminent_unlock_gain_ms_total") or 0.0) / calls
+        )
+        stats["future_ladder_entry_match_rate"] = (
+            float(stats.get("future_ladder_match_count_total") or 0.0)
+            / max(1.0, float(stats.get("future_ladder_entry_count_total") or 0.0))
+        )
+        stats["future_ladder_req_bridge_hit_rate"] = (
+            float(stats.get("bridge_hit_req_count_total") or 0.0)
+            / max(1.0, float(stats.get("future_ladder_req_count_total") or 0.0))
+        )
+        stats["selected_future_ladder_entry_match_rate"] = (
+            float(stats.get("selected_future_ladder_match_count_total") or 0.0)
+            / max(
+                1.0,
+                float(stats.get("selected_future_ladder_entry_count_total") or 0.0),
+            )
+        )
+        stats["selected_bridge_gain_rate"] = (
+            float(stats.get("selected_with_bridge_gain_count") or 0.0)
+            / selected_count
+        )
+        stats["selected_imminent_unlock_rate"] = (
+            float(stats.get("selected_with_imminent_unlock_count") or 0.0)
+            / selected_count
+        )
         stats["selected_total_gain_ms_avg"] = (
             float(stats.get("selected_total_gain_ms_total") or 0.0)
+            / selected_count
+        )
+        stats["opportunity_current_dfs_loss_ms_avg"] = (
+            float(stats.get("opportunity_current_dfs_loss_ms_total") or 0.0) / calls
+        )
+        stats["opportunity_net_gain_ms_avg"] = (
+            float(stats.get("opportunity_net_gain_ms_total") or 0.0) / calls
+        )
+        stats["opportunity_accepted_rate"] = (
+            float(stats.get("opportunity_accepted_count_total") or 0.0)
+            / max(
+                1.0,
+                float(stats.get("opportunity_accepted_count_total") or 0.0)
+                + float(stats.get("opportunity_rejected_count_total") or 0.0),
+            )
+        )
+        stats["selected_opportunity_current_dfs_loss_ms_avg"] = (
+            float(stats.get("selected_opportunity_current_dfs_loss_ms_total") or 0.0)
+            / selected_count
+        )
+        stats["selected_opportunity_net_gain_ms_avg"] = (
+            float(stats.get("selected_opportunity_net_gain_ms_total") or 0.0)
+            / selected_count
+        )
+        stats["selected_opportunity_accepted_rate"] = (
+            float(stats.get("selected_opportunity_accepted_count_total") or 0.0)
             / selected_count
         )
         stats["selected_normalized_lag_avg"] = (
@@ -607,9 +1056,17 @@ class SchedulePolicy:
                 key = (entry["level"], entry["prefix_hash"])
                 bucket = index.setdefault(
                     key,
-                    {"req_ids": set(), "prefix_len": 0.0, "ms_per_token": 0.0},
+                    {
+                        "req_ids": set(),
+                        "prefix_len": 0.0,
+                        "ms_per_token": 0.0,
+                        "nodes": set(),
+                    },
                 )
                 bucket["req_ids"].add(id(req))
+                node = getattr(req, "last_node", None)
+                if node is not None:
+                    bucket["nodes"].add(node)
                 bucket["prefix_len"] = max(
                     float(bucket["prefix_len"]), float(entry["prefix_len"])
                 )
@@ -729,13 +1186,31 @@ class SchedulePolicy:
 
     @staticmethod
     def _mpls_bridge_release_gain_ms(req: Req, ready_prefix_index: Dict[tuple, dict]) -> float:
+        return SchedulePolicy._mpls_bridge_release_gain_info(
+            req, ready_prefix_index
+        )["gain_ms"]
+
+    @staticmethod
+    def _mpls_bridge_release_gain_info(
+        req: Req, ready_prefix_index: Dict[tuple, dict]
+    ) -> dict:
         hint = getattr(req, "structured_hints", None)
         raw = getattr(hint, "downstream_release_credit", None) if hint else None
         if not isinstance(raw, dict) or not ready_prefix_index:
-            return 0.0
+            return {
+                "gain_ms": 0.0,
+                "future_entry_count": 0,
+                "matched_entry_count": 0,
+                "ready_match_count": 0,
+            }
         future_entries = SchedulePolicy._mpls_future_prefix_entries(raw)
         if not future_entries:
-            return 0.0
+            return {
+                "gain_ms": 0.0,
+                "future_entry_count": 0,
+                "matched_entry_count": 0,
+                "ready_match_count": 0,
+            }
         expected_ready = SchedulePolicy._safe_float(raw.get("expected_ready_count"), 1.0)
         expected_ready = max(1.0, expected_ready)
         confidence = SchedulePolicy._safe_float(raw.get("confidence"), 1.0)
@@ -743,6 +1218,9 @@ class SchedulePolicy:
         ms_per_token = SchedulePolicy._mpls_prefill_ms_per_token(req)
 
         best_gain = 0.0
+        matched_entry_count = 0
+        ready_match_count_total = 0
+        matched_nodes = set()
         for entry in future_entries:
             bucket = ready_prefix_index.get((entry["level"], entry["prefix_hash"]))
             if not bucket:
@@ -759,6 +1237,11 @@ class SchedulePolicy:
             )
             if shared_len <= 0.0:
                 continue
+            matched_entry_count += 1
+            ready_match_count_total += ready_match_count
+            nodes = bucket.get("nodes")
+            if isinstance(nodes, set):
+                matched_nodes.update(nodes)
             best_gain = max(
                 best_gain,
                 shared_len
@@ -769,7 +1252,42 @@ class SchedulePolicy:
                 * SchedulePolicy._mpls_structural_unlock_multiplier(raw)
                 * MPLS_BRIDGE_RELEASE_WEIGHT,
             )
-        return max(0.0, best_gain)
+        return {
+            "gain_ms": max(0.0, best_gain),
+            "future_entry_count": len(future_entries),
+            "matched_entry_count": matched_entry_count,
+            "ready_match_count": ready_match_count_total,
+            "matched_nodes": matched_nodes,
+        }
+
+    @staticmethod
+    def _mpls_imminent_unlock_gain_info(req: Req, bridge_info: dict) -> dict:
+        if float(bridge_info.get("gain_ms") or 0.0) > 0.0:
+            return {"gain_ms": 0.0}
+        hint = getattr(req, "structured_hints", None)
+        raw = getattr(hint, "downstream_release_credit", None) if hint else None
+        if not isinstance(raw, dict):
+            return {"gain_ms": 0.0}
+        future_entries = SchedulePolicy._mpls_future_prefix_entries(raw)
+        if not future_entries:
+            return {"gain_ms": 0.0}
+        expected_ready = SchedulePolicy._safe_float(
+            raw.get("expected_ready_count"), 1.0
+        )
+        expected_ready = max(1.0, expected_ready)
+        confidence = SchedulePolicy._safe_float(raw.get("confidence"), 1.0)
+        confidence = max(0.0, min(1.0, confidence))
+        ms_per_token = SchedulePolicy._mpls_prefill_ms_per_token(req)
+        future_prefix_len = max(float(entry["prefix_len"]) for entry in future_entries)
+        gain = (
+            future_prefix_len
+            * ms_per_token
+            * expected_ready
+            * confidence
+            * SchedulePolicy._mpls_structural_unlock_multiplier(raw)
+            * max(0.0, MPLS_IMMINENT_UNLOCK_WEIGHT)
+        )
+        return {"gain_ms": max(0.0, gain)}
 
     @staticmethod
     def _mpls_future_prefix_entries(raw: dict) -> List[dict]:
