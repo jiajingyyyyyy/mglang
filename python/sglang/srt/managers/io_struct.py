@@ -171,6 +171,7 @@ class StructuredRequestHints:
     trace_label: Optional[str] = None
     trace_id: Optional[str] = None
     task_id: Optional[str] = None
+    program_id: Optional[str] = None
     prompt_prefix_hash: Optional[str] = None
     prefix_ladder: Optional[List[Dict[str, Any]]] = None
     cache_pin_ranges: Optional[List[Dict[str, Any]]] = None
@@ -206,6 +207,7 @@ class StructuredRequestHints:
             "trace_label",
             "trace_id",
             "task_id",
+            "program_id",
             "prompt_prefix_hash",
         )
         number_fields = (

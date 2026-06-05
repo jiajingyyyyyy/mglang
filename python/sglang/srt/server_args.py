@@ -334,6 +334,13 @@ class ServerArgs:
     abort_on_priority_when_disabled: bool = False
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
+    plas_service_accounting: str = "completed-request"
+    plas_missing_program_id_policy: str = "rid"
+    plas_trace_file: Optional[str] = None
+    plas_queue_service_thresholds: str = "0,0.25,0.5,1,2,4,8"
+    plas_queue_quanta: str = "0.02,0.04,0.08,0.16,0.32,0.64,1.28"
+    plas_starvation_beta: float = 5.0
+    plas_enable_preemption: bool = True
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
@@ -3204,8 +3211,54 @@ class ServerArgs:
                 "priority",
                 "routing-key",
                 "structured-hint",
+                "plas",
+                "plas-mlfq",
             ],
             help="The scheduling policy of the requests.",
+        )
+        parser.add_argument(
+            "--plas-service-accounting",
+            type=str,
+            default=ServerArgs.plas_service_accounting,
+            choices=["completed-request", "forward-step"],
+            help="How PLAS attributes model service time to programs.",
+        )
+        parser.add_argument(
+            "--plas-missing-program-id-policy",
+            type=str,
+            default=ServerArgs.plas_missing_program_id_policy,
+            choices=["rid", "session", "error"],
+            help="Fallback behavior when PLAS requests lack sglang_hints.program_id/task_id.",
+        )
+        parser.add_argument(
+            "--plas-trace-file",
+            type=str,
+            default=ServerArgs.plas_trace_file,
+            help="Optional JSONL file for PLAS enqueue/admit/finish events.",
+        )
+        parser.add_argument(
+            "--plas-queue-service-thresholds",
+            type=str,
+            default=ServerArgs.plas_queue_service_thresholds,
+            help="Comma-separated lower service-time bounds for PLAS MLFQ queues; last queue is unbounded.",
+        )
+        parser.add_argument(
+            "--plas-queue-quanta",
+            type=str,
+            default=ServerArgs.plas_queue_quanta,
+            help="Comma-separated per-queue time quanta in seconds for PLAS MLFQ.",
+        )
+        parser.add_argument(
+            "--plas-starvation-beta",
+            type=float,
+            default=ServerArgs.plas_starvation_beta,
+            help="PLAS MLFQ anti-starvation threshold for total_wait / total_service.",
+        )
+        parser.add_argument(
+            "--plas-enable-preemption",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.plas_enable_preemption,
+            help="Enable PLAS MLFQ preemption/retraction of lower-priority running requests.",
         )
         parser.add_argument(
             "--enable-priority-scheduling",
@@ -5229,6 +5282,38 @@ class ServerArgs:
                 "lof",
                 "structured-hint",
             ], f"To use priority scheduling, schedule_policy must be 'fcfs', 'lof', or 'structured-hint'. '{self.schedule_policy}' is not supported."
+        assert self.plas_service_accounting in [
+            "completed-request",
+            "forward-step",
+        ], f"Invalid plas_service_accounting: {self.plas_service_accounting}"
+        assert self.plas_missing_program_id_policy in [
+            "rid",
+            "session",
+            "error",
+        ], f"Invalid plas_missing_program_id_policy: {self.plas_missing_program_id_policy}"
+        assert not (
+            self.schedule_policy in ["plas", "plas-mlfq"]
+            and self.enable_priority_scheduling
+        ), "PLAS ignores request-level priority; do not combine PLAS policies with --enable-priority-scheduling."
+        plas_thresholds = self._parse_plas_float_list(
+            self.plas_queue_service_thresholds, "--plas-queue-service-thresholds"
+        )
+        plas_quanta = self._parse_plas_float_list(
+            self.plas_queue_quanta, "--plas-queue-quanta"
+        )
+        assert plas_thresholds and plas_thresholds[0] == 0.0, (
+            "--plas-queue-service-thresholds must start at 0 to match PLAS "
+            "queue ranges [Q_i^lo, Q_i^hi)."
+        )
+        assert plas_thresholds == sorted(set(plas_thresholds)), (
+            "--plas-queue-service-thresholds must be strictly increasing."
+        )
+        assert len(plas_thresholds) == len(plas_quanta), (
+            "--plas-queue-quanta must have the same length as "
+            "--plas-queue-service-thresholds."
+        )
+        assert all(q > 0 for q in plas_quanta), "--plas-queue-quanta must be positive."
+        assert self.plas_starvation_beta > 0.0, "--plas-starvation-beta must be positive."
 
         # Check multi-item scoring
         if self.multi_item_scoring_delimiter is not None:
@@ -5440,6 +5525,20 @@ class ServerArgs:
             "Different tp size is supported only when one tp is multiple of the other. "
             f"decode_tp={decode_tp}, prefill_tp={prefill_tp}"
         )
+
+    @staticmethod
+    def _parse_plas_float_list(value: str, arg_name: str) -> List[float]:
+        try:
+            parsed = [
+                float(item.strip())
+                for item in str(value).split(",")
+                if item.strip()
+            ]
+        except ValueError:
+            assert False, f"{arg_name} must be a comma-separated list of floats."
+        assert parsed, f"{arg_name} cannot be empty."
+        assert all(item >= 0.0 for item in parsed), f"{arg_name} must be non-negative."
+        return parsed
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:

@@ -1705,6 +1705,13 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0,
             "max_new_tokens": max_new_tokens,
         },
+        "structured_hints": {
+            "program_id": "sglang:internal:warmup",
+            "task_id": "sglang-warmup",
+            "agent_type": "system",
+            "trace_label": "warmup",
+            "stage_id": "server_warmup",
+        },
     }
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
@@ -1740,6 +1747,13 @@ def _execute_server_warmup(server_args: ServerArgs):
             "max_tokens": max_new_tokens,
             "stream": False,
             "temperature": 0.0,
+            "sglang_hints": {
+                "program_id": "sglang:internal:warmup",
+                "task_id": "sglang-warmup",
+                "agent_type": "system",
+                "trace_label": "warmup",
+                "stage_id": "server_warmup",
+            },
         }
     else:
         json_data["text"] = ["The capital city of France is"] * server_args.dp_size
@@ -1775,6 +1789,13 @@ def _execute_server_warmup(server_args: ServerArgs):
                     "temperature": 0.0,
                     "max_new_tokens": 8,
                     "ignore_eos": True,
+                },
+                "structured_hints": {
+                    "program_id": "sglang:internal:warmup",
+                    "task_id": "sglang-warmup",
+                    "agent_type": "system",
+                    "trace_label": "warmup",
+                    "stage_id": "server_warmup",
                 },
                 "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
                 # This is a hack to ensure fake transfer is enabled during prefill warmup

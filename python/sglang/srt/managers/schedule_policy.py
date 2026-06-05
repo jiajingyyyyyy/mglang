@@ -157,6 +157,7 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.managers.plas_scheduler import PLASProcessTable
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
@@ -208,6 +209,8 @@ class CacheAgnosticPolicy(Enum):
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
     STRUCTURED_HINT = "structured-hint"  # locality-aware advisory request hints
+    PLAS = "plas"  # Program-Level Attained Service
+    PLAS_MLFQ = "plas-mlfq"  # PLAS with discretized queues and quanta
 
 
 class SchedulePolicy:
@@ -220,6 +223,7 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        plas_process_table: Optional["PLASProcessTable"] = None,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -227,6 +231,7 @@ class SchedulePolicy:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        self.plas_process_table = plas_process_table
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -310,6 +315,12 @@ class SchedulePolicy:
                     running_batch,
                     self.enable_priority_scheduling,
                     self.priority_sign,
+                )
+            elif policy == CacheAgnosticPolicy.PLAS:
+                SchedulePolicy._sort_by_plas(waiting_queue, self.plas_process_table)
+            elif policy == CacheAgnosticPolicy.PLAS_MLFQ:
+                SchedulePolicy._sort_by_plas_mlfq(
+                    waiting_queue, self.plas_process_table
                 )
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
@@ -398,6 +409,33 @@ class SchedulePolicy:
                         )
                     )
         return temporary_deprioritized
+
+    @staticmethod
+    def _sort_by_plas(
+        waiting_queue: List[Req],
+        plas_process_table: Optional["PLASProcessTable"],
+    ) -> None:
+        if plas_process_table is None:
+            waiting_queue.sort(
+                key=lambda req: (
+                    getattr(getattr(req, "time_stats", None), "wait_queue_entry_time", 0)
+                    or 0.0,
+                    str(req.rid),
+                )
+            )
+            return
+
+        waiting_queue.sort(key=plas_process_table.priority)
+
+    @staticmethod
+    def _sort_by_plas_mlfq(
+        waiting_queue: List[Req],
+        plas_process_table: Optional["PLASProcessTable"],
+    ) -> None:
+        if plas_process_table is None:
+            SchedulePolicy._sort_by_plas(waiting_queue, None)
+            return
+        waiting_queue.sort(key=plas_process_table.mlfq_priority)
 
     @staticmethod
     def _sort_by_longest_prefix(
