@@ -633,6 +633,25 @@ class Req(ReqDllmMixin):
             getattr(structured_hints, "trace_label", None) if structured_hints else None
         )
 
+        # Program-Level Attained Service (PLAS) scheduler metadata.
+        self.plas_program_id: Optional[str] = None
+        self.plas_enqueue_time: float = 0.0
+        self.plas_admit_time: float = 0.0
+        self.plas_first_forward_time: float = 0.0
+        self.plas_finish_time: float = 0.0
+        self.plas_service_s: float = 0.0
+        self.plas_priority_at_admit: Optional[float] = None
+        self.plas_active_counted: bool = False
+        self.plas_queue_idx: int = 0
+        self.plas_quanta_s: float = 0.0
+        self.plas_call_wait_s: float = 0.0
+        self.plas_call_model_time_s: float = 0.0
+        self.plas_last_queue_enter_time: float = 0.0
+        self.plas_starvation_ratio: float = 0.0
+        self.plas_demoted_count: int = 0
+        self.plas_boosted_count: int = 0
+        self.plas_preempted_count: int = 0
+
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)

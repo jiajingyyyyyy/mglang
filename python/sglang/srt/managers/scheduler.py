@@ -141,6 +141,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
 )
+from sglang.srt.managers.plas_scheduler import PLASProcessTable, PLASQueueConfig
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     ModelWorkerBatch,
@@ -297,6 +298,15 @@ class Scheduler(
         self.dp_size = server_args.dp_size
         self.nccl_port = port_args.nccl_port
         self.schedule_policy = server_args.schedule_policy
+        self.plas_mlfq_enabled = server_args.schedule_policy == "plas-mlfq"
+        self.plas_process_table = PLASProcessTable(
+            server_args.plas_missing_program_id_policy,
+            queue_config=(
+                self._build_plas_queue_config(server_args)
+                if self.plas_mlfq_enabled
+                else None
+            ),
+        )
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
             server_args.abort_on_priority_when_disabled
@@ -785,6 +795,22 @@ class Scheduler(
                 )
                 self.enable_dynamic_chunking = False
 
+    @staticmethod
+    def _parse_plas_float_tuple(value: str) -> Tuple[float, ...]:
+        return tuple(
+            float(item.strip()) for item in str(value).split(",") if item.strip()
+        )
+
+    @classmethod
+    def _build_plas_queue_config(cls, server_args: ServerArgs) -> PLASQueueConfig:
+        return PLASQueueConfig(
+            service_thresholds_s=cls._parse_plas_float_tuple(
+                server_args.plas_queue_service_thresholds
+            ),
+            quanta_s=cls._parse_plas_float_tuple(server_args.plas_queue_quanta),
+            starvation_beta=float(server_args.plas_starvation_beta),
+        )
+
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
@@ -793,6 +819,11 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            plas_process_table=(
+                self.plas_process_table
+                if self.schedule_policy in ("plas", "plas-mlfq")
+                else None
+            ),
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         if self.server_args.enable_prefill_delayer:
@@ -808,7 +839,9 @@ class Scheduler(
                 token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
             )
         # Enable preemption for priority scheduling.
-        self.try_preemption = self.enable_priority_scheduling
+        self.try_preemption = self.enable_priority_scheduling or (
+            self.plas_mlfq_enabled and self.server_args.plas_enable_preemption
+        )
         self.init_new_token_ratio = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
             * self.server_args.schedule_conservativeness,
@@ -1684,9 +1717,12 @@ class Scheduler(
                 return
             if self._abort_on_queued_limit(req):
                 return
+            now = time.perf_counter()
+            req.time_stats.wait_queue_entry_time = now
+            if not self._plas_on_enqueue(req, now, is_retracted=is_retracted):
+                return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
-            req.time_stats.wait_queue_entry_time = time.perf_counter()
             trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
@@ -1757,6 +1793,7 @@ class Scheduler(
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
+                self._plas_account_aborted(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
@@ -1797,6 +1834,7 @@ class Scheduler(
                     req,
                 )
                 deleted_reqs.add(req)
+                self._plas_account_aborted(req)
 
         if deleted_reqs:
             self.waiting_queue = [
@@ -2071,6 +2109,7 @@ class Scheduler(
                 "trace_label": getattr(hint, "trace_label", None),
                 "trace_id": getattr(hint, "trace_id", None),
                 "task_id": getattr(hint, "task_id", None),
+                "program_id": getattr(hint, "program_id", None),
                 "motif_id": getattr(hint, "motif_id", None),
                 "stage_id": getattr(hint, "stage_id", None),
                 "prefix_key": getattr(hint, "prefix_key", None),
@@ -2112,6 +2151,38 @@ class Scheduler(
                 "cache_pin_range_count": len(cache_pin_ranges),
                 "cache_pin_range_tokens": cache_pin_range_tokens,
                 "queue_wait_s": max(0.0, now_perf - wait_entry) if wait_entry else None,
+                "plas_program_id": getattr(req, "plas_program_id", None),
+                "plas_program_service_s": self.plas_process_table.program_service(
+                    getattr(req, "plas_program_id", None)
+                ),
+                "plas_req_service_s": float(
+                    getattr(req, "plas_service_s", 0.0) or 0.0
+                ),
+                "plas_priority_at_admit": getattr(
+                    req, "plas_priority_at_admit", None
+                ),
+                "plas_enqueue_time": getattr(req, "plas_enqueue_time", 0.0) or None,
+                "plas_admit_time": getattr(req, "plas_admit_time", 0.0) or None,
+                "plas_finish_time": getattr(req, "plas_finish_time", 0.0) or None,
+                "plas_queue_wait_s": (
+                    max(
+                        0.0,
+                        (getattr(req, "plas_admit_time", 0.0) or now_perf)
+                        - getattr(req, "plas_enqueue_time", 0.0),
+                    )
+                    if getattr(req, "plas_enqueue_time", 0.0)
+                    else None
+                ),
+                "plas_queue_idx": getattr(req, "plas_queue_idx", None),
+                "plas_quanta_s": getattr(req, "plas_quanta_s", None),
+                "plas_call_wait_s": getattr(req, "plas_call_wait_s", None),
+                "plas_call_model_time_s": getattr(
+                    req, "plas_call_model_time_s", None
+                ),
+                "plas_starvation_ratio": getattr(req, "plas_starvation_ratio", None),
+                "plas_demoted_count": getattr(req, "plas_demoted_count", 0),
+                "plas_boosted_count": getattr(req, "plas_boosted_count", 0),
+                "plas_preempted_count": getattr(req, "plas_preempted_count", 0),
                 "max_new_tokens": int(
                     getattr(getattr(req, "sampling_params", None), "max_new_tokens", 0)
                     or 0
@@ -2131,6 +2202,262 @@ class Scheduler(
                         f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
             except OSError as exc:
                 logger.warning("Failed to write SGLang schedule trace: %s", exc)
+
+    def _write_plas_trace(
+        self,
+        *,
+        event: str,
+        reqs: List[Req],
+        now_perf: Optional[float] = None,
+    ) -> None:
+        trace_path = self.server_args.plas_trace_file
+        if not trace_path:
+            return
+
+        now_perf = time.perf_counter() if now_perf is None else now_perf
+        rows = []
+        for req in reqs:
+            program_id = getattr(req, "plas_program_id", None)
+            state = self.plas_process_table.programs.get(program_id)
+            wait_entry = getattr(req, "plas_enqueue_time", 0.0) or 0.0
+            admit_time = getattr(req, "plas_admit_time", 0.0) or 0.0
+            finish_time = getattr(req, "plas_finish_time", 0.0) or 0.0
+            rows.append(
+                {
+                    "ts": time.time(),
+                    "event": event,
+                    "rid": str(getattr(req, "rid", "")),
+                    "plas_program_id": program_id,
+                    "plas_program_service_s": (
+                        float(state.completed_service_s) if state is not None else 0.0
+                    ),
+                    "plas_req_service_s": float(
+                        getattr(req, "plas_service_s", 0.0) or 0.0
+                    ),
+                    "plas_priority_at_admit": getattr(
+                        req, "plas_priority_at_admit", None
+                    ),
+                    "plas_enqueue_time": wait_entry or None,
+                    "plas_admit_time": admit_time or None,
+                    "plas_finish_time": finish_time or None,
+                    "plas_queue_wait_s": (
+                        max(0.0, (admit_time or now_perf) - wait_entry)
+                        if wait_entry
+                        else None
+                    ),
+                    "program_completed_reqs": (
+                        int(state.num_completed_reqs) if state is not None else 0
+                    ),
+                    "program_active_reqs": (
+                        int(state.num_active_reqs) if state is not None else 0
+                    ),
+                    "plas_queue_idx": getattr(req, "plas_queue_idx", None),
+                    "plas_quanta_s": getattr(req, "plas_quanta_s", None),
+                    "plas_call_wait_s": getattr(req, "plas_call_wait_s", None),
+                    "plas_call_model_time_s": getattr(
+                        req, "plas_call_model_time_s", None
+                    ),
+                    "plas_starvation_ratio": getattr(
+                        req, "plas_starvation_ratio", None
+                    ),
+                    "plas_demoted_count": getattr(req, "plas_demoted_count", 0),
+                    "plas_boosted_count": getattr(req, "plas_boosted_count", 0),
+                    "plas_preempted_count": getattr(req, "plas_preempted_count", 0),
+                    "missing_program_id_count": (
+                        self.plas_process_table.missing_program_id_count
+                    ),
+                    "plas_total_demoted_count": self.plas_process_table.demoted_count,
+                    "plas_total_promoted_count": self.plas_process_table.promoted_count,
+                    "plas_total_preempted_count": self.plas_process_table.preempted_count,
+                }
+            )
+        try:
+            with open(trace_path, "a", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError as exc:
+            logger.warning("Failed to write PLAS trace: %s", exc)
+
+    def _plas_on_enqueue(
+        self, req: Req, now: float, *, is_retracted: bool = False
+    ) -> bool:
+        if self.schedule_policy not in ("plas", "plas-mlfq"):
+            return True
+        try:
+            self.plas_process_table.on_enqueue(
+                req, now, is_retracted=is_retracted and self.plas_mlfq_enabled
+            )
+        except ValueError as exc:
+            self.send_to_tokenizer.send_output(
+                AbortReq(
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.BAD_REQUEST,
+                        "message": str(exc),
+                    },
+                    rid=req.rid,
+                ),
+                req,
+            )
+            return False
+        self._write_plas_trace(event="enqueue", reqs=[req], now_perf=now)
+        return True
+
+    def _plas_on_admit(self, reqs: List[Req], now: float) -> None:
+        if self.schedule_policy not in ("plas", "plas-mlfq"):
+            return
+        for req in reqs:
+            program_id = getattr(req, "plas_program_id", None)
+            if not program_id:
+                program_id = self.plas_process_table.get_program_id(req)
+                req.plas_program_id = program_id
+            req.plas_admit_time = now
+            if req.plas_first_forward_time <= 0.0:
+                req.plas_first_forward_time = now
+            if self.plas_mlfq_enabled:
+                self.plas_process_table.on_admit(req, now)
+            req.plas_priority_at_admit = self.plas_process_table.program_service(
+                program_id
+            )
+        self._write_plas_trace(event="prefill_admit", reqs=reqs, now_perf=now)
+
+    def _plas_record_forward_step(self, batch: ScheduleBatch, elapsed_s: float) -> None:
+        if (
+            self.schedule_policy not in ("plas", "plas-mlfq")
+            or (
+                self.server_args.plas_service_accounting != "forward-step"
+                and not self.plas_mlfq_enabled
+            )
+        ):
+            return
+        service_s = max(0.0, float(elapsed_s or 0.0))
+        if service_s <= 0.0:
+            return
+        for req in batch.reqs:
+            if not req.finished() and not getattr(req, "is_retracted", False):
+                if self.plas_mlfq_enabled:
+                    self.plas_process_table.on_forward_step(req, service_s)
+                if self.server_args.plas_service_accounting == "forward-step":
+                    req.plas_service_s += service_s
+
+    def _plas_account_finished(self, reqs: List[Req]) -> None:
+        if self.schedule_policy not in ("plas", "plas-mlfq"):
+            return
+
+        finished_reqs = []
+        now = time.perf_counter()
+        for req in reqs:
+            if (
+                not req.finished()
+                or getattr(req, "plas_finish_time", 0.0) > 0.0
+                or getattr(req, "is_retracted", False)
+            ):
+                continue
+            first_forward = getattr(req, "plas_first_forward_time", 0.0) or getattr(
+                req.time_stats, "forward_entry_time", 0.0
+            )
+            if self.plas_mlfq_enabled:
+                req.plas_service_s = max(
+                    float(getattr(req, "plas_service_s", 0.0) or 0.0),
+                    float(getattr(req, "plas_call_model_time_s", 0.0) or 0.0),
+                )
+            elif self.server_args.plas_service_accounting == "completed-request":
+                req.plas_service_s += max(0.0, now - (first_forward or now))
+            req.plas_finish_time = now
+            self.plas_process_table.on_request_service(
+                req,
+                req.plas_service_s,
+                now,
+                wait_s=getattr(req, "plas_call_wait_s", 0.0),
+            )
+            finished_reqs.append(req)
+        if finished_reqs:
+            self._write_plas_trace(
+                event="request_finish", reqs=finished_reqs, now_perf=now
+            )
+
+    def _plas_account_aborted(self, req: Req) -> None:
+        if self.schedule_policy not in ("plas", "plas-mlfq"):
+            return
+        self.plas_process_table.on_request_abort(req, time.perf_counter())
+
+    def _plas_mlfq_prepare_waiting_queue(self, now: float) -> None:
+        if not self.plas_mlfq_enabled:
+            return
+        promoted_reqs = []
+        for req in self.waiting_queue:
+            if self.plas_process_table.maybe_promote_for_starvation(req, now):
+                promoted_reqs.append(req)
+        if promoted_reqs:
+            self._write_plas_trace(
+                event="anti_starvation_promote", reqs=promoted_reqs, now_perf=now
+            )
+
+    def _plas_mlfq_preempt_running_if_needed(self, now: float) -> None:
+        if (
+            not self.plas_mlfq_enabled
+            or not self.server_args.plas_enable_preemption
+            or self.running_batch.is_empty()
+            or len(self.waiting_queue) == 0
+        ):
+            return
+
+        self._plas_mlfq_prepare_waiting_queue(now)
+        best_waiting_queue = min(
+            int(getattr(req, "plas_queue_idx", 0) or 0) for req in self.waiting_queue
+        )
+        preemptible = set()
+        demoted = []
+        promoted = []
+        for req in self.running_batch.reqs:
+            if req.finished() or getattr(req, "is_retracted", False):
+                continue
+            quantum_expired = getattr(req, "plas_quanta_s", 0.0) <= 0.0
+            was_demoted = self.plas_process_table.maybe_demote(req)
+            if was_demoted:
+                demoted.append(req)
+            if self.plas_process_table.maybe_promote_for_starvation(req, now):
+                promoted.append(req)
+                quantum_expired = False
+            running_queue = int(getattr(req, "plas_queue_idx", 0) or 0)
+            lower_priority_than_waiting = best_waiting_queue < running_queue
+            exhausted_with_peer_waiting = quantum_expired and (
+                best_waiting_queue <= running_queue
+            )
+            if lower_priority_than_waiting or exhausted_with_peer_waiting:
+                preemptible.add(req)
+
+        if demoted:
+            self._write_plas_trace(event="queue_demote", reqs=demoted, now_perf=now)
+        if promoted:
+            self._write_plas_trace(
+                event="anti_starvation_promote", reqs=promoted, now_perf=now
+            )
+        if not preemptible:
+            return
+
+        keep_indices = []
+        release_counter = 0
+        preempted_reqs = []
+        for idx, running_req in enumerate(self.running_batch.reqs):
+            if running_req in preemptible:
+                release_counter += 1
+                running_req.plas_preempted_count += 1
+                self.plas_process_table.preempted_count += 1
+                self.running_batch.release_req(
+                    idx,
+                    len(self.running_batch.reqs) - release_counter,
+                    self.server_args,
+                )
+                preempted_reqs.append(running_req)
+            else:
+                keep_indices.append(idx)
+
+        self.running_batch.filter_batch(keep_indices=keep_indices)
+        self.running_batch.batch_is_full = False
+        for req in preempted_reqs:
+            self._add_request_to_queue(req, is_retracted=True)
+        self._write_plas_trace(event="preempt_requeue", reqs=preempted_reqs, now_perf=now)
 
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
@@ -2166,6 +2493,10 @@ class Scheduler(
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
+
+        now = time.perf_counter()
+        self._plas_mlfq_prepare_waiting_queue(now)
+        self._plas_mlfq_preempt_running_if_needed(now)
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
@@ -2235,9 +2566,9 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
-                if not self.try_preemption or not adder.preempt_to_schedule(
-                    req, self.server_args
-                ):
+                if not self.enable_priority_scheduling:
+                    break
+                if not adder.preempt_to_schedule(req, self.server_args):
                     break
 
             if self.enable_hicache_storage:
@@ -2302,13 +2633,15 @@ class Scheduler(
         self.running_bs = len(self.running_batch.reqs)
 
         # Record metrics
+        admit_time = time.perf_counter()
         for req in can_run_list:
             if req.time_stats.forward_entry_time == 0:
-                req.time_stats.forward_entry_time = time.perf_counter()
+                req.time_stats.forward_entry_time = admit_time
                 if self.enable_metrics:
                     self.metrics_collector.observe_queue_time(
                         req.time_stats.get_queueing_time(),
                     )
+        self._plas_on_admit(can_run_list, admit_time)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -2444,6 +2777,7 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        plas_forward_start = time.perf_counter()
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
@@ -2459,7 +2793,11 @@ class Scheduler(
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
+            ret = self._run_batch_prebuilt(batch)
+            self._plas_record_forward_step(
+                batch, time.perf_counter() - plas_forward_start
+            )
+            return ret
 
         # Run forward
         if self.is_generation:
@@ -2589,6 +2927,7 @@ class Scheduler(
                 ActiveRanksOutput(status=dp_active_ranks.tolist())
             )
 
+        self._plas_record_forward_step(batch, time.perf_counter() - plas_forward_start)
         return ret
 
     def launch_batch_sample_if_needed(
@@ -2624,6 +2963,7 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
 
+        self._plas_account_finished(batch.reqs)
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
