@@ -207,6 +207,54 @@ class TestMplsScheduling(unittest.TestCase):
         stats = policy.get_mpls_stats()
         self.assertEqual(stats["selected_total_gain_ms_avg"], 150.0)
 
+    def test_mpls_unified_loss_aware_gain_blocks_bad_positive_loss(self):
+        with patch(
+            "sglang.srt.managers.schedule_policy."
+            "MPLS_DFS_OVERLAY_POSITIVE_LOSS_MIN_RATIO",
+            4.0,
+        ):
+            gain = SchedulePolicy._mpls_unified_loss_aware_gain_ms(
+                total_gain_ms=300.0,
+                current_dfs_loss_ms=1000.0,
+                opportunity_net_gain_ms=-700.0,
+                approx_zero_loss=False,
+            )
+
+        self.assertEqual(gain, 0.0)
+
+    def test_mpls_unified_loss_aware_gain_keeps_zero_loss_bridge(self):
+        gain = SchedulePolicy._mpls_unified_loss_aware_gain_ms(
+            total_gain_ms=300.0,
+            current_dfs_loss_ms=0.0,
+            opportunity_net_gain_ms=300.0,
+            approx_zero_loss=True,
+        )
+
+        self.assertEqual(gain, 300.0)
+
+    def test_mpls_unified_loss_aware_gain_allows_large_positive_loss(self):
+        patches = [
+            patch(
+                "sglang.srt.managers.schedule_policy."
+                "MPLS_DFS_OVERLAY_POSITIVE_LOSS_MIN_RATIO",
+                2.0,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_policy."
+                "MPLS_DFS_OVERLAY_MIN_NET_GAIN_MS",
+                0.0,
+            ),
+        ]
+        with patches[0], patches[1]:
+            gain = SchedulePolicy._mpls_unified_loss_aware_gain_ms(
+                total_gain_ms=5000.0,
+                current_dfs_loss_ms=1000.0,
+                opportunity_net_gain_ms=4000.0,
+                approx_zero_loss=False,
+            )
+
+        self.assertEqual(gain, 4000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

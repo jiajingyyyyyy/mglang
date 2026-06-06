@@ -82,8 +82,14 @@ MPLS_DFS_OVERLAY_OPPORTUNITY_COST = get_bool_env_var(
 MPLS_DFS_OVERLAY_OPPORTUNITY_MODE = os.environ.get(
     "SGLANG_MPLS_DFS_OVERLAY_OPPORTUNITY_MODE", "continuous"
 ).strip().lower()
+MPLS_DFS_OVERLAY_SCORING = os.environ.get(
+    "SGLANG_MPLS_DFS_OVERLAY_SCORING", "legacy"
+).strip().lower()
 MPLS_DFS_OVERLAY_POSITIVE_LOSS_MIN_RATIO = float(
     os.environ.get("SGLANG_MPLS_DFS_OVERLAY_POSITIVE_LOSS_MIN_RATIO", "4.0")
+)
+MPLS_DFS_OVERLAY_MIN_NET_GAIN_MS = float(
+    os.environ.get("SGLANG_MPLS_DFS_OVERLAY_MIN_NET_GAIN_MS", "0.0")
 )
 MPLS_DFS_APPROX_ZERO_LOSS_MS = float(
     os.environ.get("SGLANG_MPLS_DFS_APPROX_ZERO_LOSS_MS", "0.0")
@@ -106,7 +112,11 @@ MPLS_DFS_OVERLAY_APPROX_ZERO_LOSS_MAX_BONUS = float(
 MPLS_DFS_OVERLAY_POSITIVE_LOSS_MAX_BONUS = float(
     os.environ.get(
         "SGLANG_MPLS_DFS_OVERLAY_POSITIVE_LOSS_MAX_BONUS",
-        os.environ.get("SGLANG_MPLS_DFS_OVERLAY_MAX_BONUS", "0.49"),
+        (
+            "0.0"
+            if MPLS_DFS_OVERLAY_SCORING in {"loss_aware", "unified_loss_aware"}
+            else os.environ.get("SGLANG_MPLS_DFS_OVERLAY_MAX_BONUS", "0.49")
+        ),
     )
 )
 MPLS_DFS_OVERLAY_TARGET = os.environ.get(
@@ -672,6 +682,13 @@ class SchedulePolicy:
         gain_scale_ms = max(1e-6, float(MPLS_DFS_OVERLAY_GAIN_SCALE_MS or 0.0))
         loss_scale_ms = max(0.0, float(MPLS_DFS_LOSS_SCALE_MS or 0.0))
         loss_alpha = max(0.0, float(MPLS_DFS_LOSS_ALPHA or 0.0))
+        loss_aware_scoring = MPLS_DFS_OVERLAY_SCORING in {
+            "loss_aware",
+            "unified_loss_aware",
+        }
+        opportunity_cost_enabled = (
+            bool(MPLS_DFS_OVERLAY_OPPORTUNITY_COST) or loss_aware_scoring
+        )
         for req in waiting_queue:
             last_node_to_reqs[req.last_node].append(req)
             node_to_weight[req.last_node] += 1
@@ -705,7 +722,15 @@ class SchedulePolicy:
             approx_zero_loss = current_dfs_loss <= max(
                 0.0, MPLS_DFS_APPROX_ZERO_LOSS_MS
             )
-            if MPLS_DFS_OVERLAY_OPPORTUNITY_COST:
+            if loss_aware_scoring:
+                opportunity_net_gain = total_gain - loss_alpha * current_dfs_loss
+                overlay_gain = SchedulePolicy._mpls_unified_loss_aware_gain_ms(
+                    total_gain_ms=total_gain,
+                    current_dfs_loss_ms=current_dfs_loss,
+                    opportunity_net_gain_ms=opportunity_net_gain,
+                    approx_zero_loss=approx_zero_loss,
+                )
+            elif MPLS_DFS_OVERLAY_OPPORTUNITY_COST:
                 opportunity_net_gain = total_gain - loss_alpha * current_dfs_loss
                 if MPLS_DFS_OVERLAY_OPPORTUNITY_MODE == "ratio_gate":
                     if approx_zero_loss:
@@ -726,7 +751,7 @@ class SchedulePolicy:
 
             target_nodes = None
             if (
-                not MPLS_DFS_OVERLAY_OPPORTUNITY_COST
+                not opportunity_cost_enabled
                 and MPLS_DFS_OVERLAY_TARGET == "downstream"
             ):
                 target_nodes = bridge_info.get("matched_nodes")
@@ -734,8 +759,11 @@ class SchedulePolicy:
                 target_nodes = {req.last_node}
             overlay_units = overlay_gain / gain_scale_ms
             if (
-                MPLS_DFS_OVERLAY_OPPORTUNITY_COST
-                and MPLS_DFS_OVERLAY_OPPORTUNITY_MODE == "ratio_gate"
+                opportunity_cost_enabled
+                and (
+                    MPLS_DFS_OVERLAY_OPPORTUNITY_MODE == "ratio_gate"
+                    or loss_aware_scoring
+                )
             ):
                 if current_dfs_loss <= 0.0:
                     overlay_units = min(
@@ -765,14 +793,14 @@ class SchedulePolicy:
                 "approx_zero_loss_count": 1.0 if approx_zero_loss else 0.0,
                 "opportunity_accepted_count": (
                     1.0
-                    if MPLS_DFS_OVERLAY_OPPORTUNITY_COST and overlay_gain > 0.0
+                    if opportunity_cost_enabled and overlay_units > 0.0
                     else 0.0
                 ),
                 "opportunity_rejected_count": (
                     1.0
-                    if MPLS_DFS_OVERLAY_OPPORTUNITY_COST
+                    if opportunity_cost_enabled
                     and total_gain > 0.0
-                    and overlay_gain <= 0.0
+                    and overlay_units <= 0.0
                     else 0.0
                 ),
                 "future_ladder_entry_count": float(
@@ -936,6 +964,37 @@ class SchedulePolicy:
             child = parent
             parent = getattr(child, "parent", None)
         return max(0.0, max_deficit_units) * gain_scale_ms
+
+    @staticmethod
+    def _mpls_unified_loss_aware_gain_ms(
+        *,
+        total_gain_ms: float,
+        current_dfs_loss_ms: float,
+        opportunity_net_gain_ms: float,
+        approx_zero_loss: bool,
+    ) -> float:
+        """Return the MPLS overlay gain after explicit DFS-loss accounting.
+
+        Zero-loss and approximate-zero-loss bridge opportunities are allowed to
+        keep their full future gain.  Positive-loss opportunities must satisfy
+        both the net-gain and gain/loss-ratio gates.  With the loss-aware scoring
+        mode, positive-loss bonuses default to zero unless the caller explicitly
+        opts in via SGLANG_MPLS_DFS_OVERLAY_POSITIVE_LOSS_MAX_BONUS.
+        """
+        total_gain = max(0.0, float(total_gain_ms or 0.0))
+        if total_gain <= 0.0:
+            return 0.0
+        dfs_loss = max(0.0, float(current_dfs_loss_ms or 0.0))
+        if dfs_loss <= 0.0 or approx_zero_loss:
+            return total_gain
+
+        net_gain = float(opportunity_net_gain_ms or 0.0)
+        if net_gain <= max(0.0, float(MPLS_DFS_OVERLAY_MIN_NET_GAIN_MS or 0.0)):
+            return 0.0
+        min_ratio = max(0.0, float(MPLS_DFS_OVERLAY_POSITIVE_LOSS_MIN_RATIO or 0.0))
+        if min_ratio > 0.0 and total_gain / dfs_loss < min_ratio:
+            return 0.0
+        return max(0.0, net_gain)
 
     @staticmethod
     def _record_mpls_gain_loss_diagnostics(
