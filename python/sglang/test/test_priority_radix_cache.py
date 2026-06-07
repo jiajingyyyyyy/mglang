@@ -175,6 +175,70 @@ class PriorityRadixCacheTest(unittest.TestCase):
 
         self.assertEqual(allocator.freed[0], [20, 21, 22])
 
+    def test_pressure_demotes_low_value_request_pin_before_range_pin(self) -> None:
+        cache, allocator = self.make_cache()
+        now = time.monotonic()
+        cache.insert(
+            InsertParams(
+                key=RadixKey(list(range(100, 120))),
+                priority=1.0,
+                cache_pin_expires_at=now + 10.0,
+                cache_hint_prefix_key="broad-request",
+                cache_pin_metadata={
+                    "pin_mode": "request_soft_priority",
+                    "motif_id": "motif-a",
+                    "stage_id": "stage-a",
+                },
+            )
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey(list(range(200, 220))),
+                priority=0.0,
+                cache_pin_expires_at=now + 10.0,
+                cache_pin_ranges=[
+                    {
+                        "start": 0,
+                        "end": 20,
+                        "priority": 1.0,
+                        "cache_pin_ttl_ms": 10000.0,
+                        "source": "reuse",
+                    }
+                ],
+                cache_pin_metadata={
+                    "pin_mode": "layered_static",
+                    "motif_id": "motif-b",
+                    "stage_id": "stage-b",
+                },
+            )
+        )
+
+        from sglang.srt.mem_cache import radix_cache as radix_cache_module
+
+        old_pressure = radix_cache_module.PRIORITY_PIN_DEMOTION_PRESSURE_FRACTION
+        old_min_value = radix_cache_module.PRIORITY_PIN_DEMOTION_MIN_VALUE
+        try:
+            radix_cache_module.PRIORITY_PIN_DEMOTION_PRESSURE_FRACTION = 0.01
+            radix_cache_module.PRIORITY_PIN_DEMOTION_MIN_VALUE = 0.1
+            cache.evict(EvictParams(num_tokens=5))
+        finally:
+            radix_cache_module.PRIORITY_PIN_DEMOTION_PRESSURE_FRACTION = old_pressure
+            radix_cache_module.PRIORITY_PIN_DEMOTION_MIN_VALUE = old_min_value
+
+        self.assertEqual(allocator.freed[0], list(range(100, 120)))
+        stats = cache.priority_eviction_stats()
+        self.assertEqual(stats["priority_pressure_demoted_blocks"], 20.0)
+        self.assertEqual(stats["priority_reuse_evicted_blocks"], 0.0)
+        self.assertEqual(stats["pinned_blocks_evicted_before_reuse"], 20.0)
+        self.assertEqual(stats["pinned_evicted_before_reuse_rate"], 0.5)
+        self.assertEqual(
+            stats["eviction_victim_pin_mode"]["request_soft_priority"], 20.0
+        )
+        self.assertEqual(stats["eviction_victim_motif_id"]["motif-a"], 20.0)
+        self.assertEqual(stats["eviction_victim_stage_id"]["stage-a"], 20.0)
+        self.assertEqual(stats["eviction_reason"]["forced_unpin"], 20.0)
+        self.assertEqual(stats["forced_unpin_count"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

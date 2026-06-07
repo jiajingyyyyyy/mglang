@@ -3207,6 +3207,8 @@ class ServerArgs:
                 "slo-cost-prefix-dfs",
                 "semantic-slo-cost-dfs",
                 "mpls",
+                "mpls_slo",
+                "structure-informed-slo",
                 "lof",
                 "priority",
                 "routing-key",

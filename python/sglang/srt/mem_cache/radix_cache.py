@@ -24,6 +24,7 @@ The radix tree data structure for managing the KV cache.
 
 import heapq
 import logging
+import os
 import sys
 import time
 from collections import defaultdict
@@ -33,6 +34,20 @@ from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 import torch
 
 logger = logging.getLogger(__name__)
+
+PRIORITY_PIN_PRESSURE_DEMOTION = (
+    os.environ.get("SGLANG_PRIORITY_PIN_PRESSURE_DEMOTION", "true").lower()
+    in ("1", "true", "yes", "on")
+)
+PRIORITY_PIN_DEMOTION_PRESSURE_FRACTION = float(
+    os.environ.get("SGLANG_PRIORITY_PIN_DEMOTION_PRESSURE_FRACTION", "0.25")
+)
+PRIORITY_PIN_DEMOTION_MIN_VALUE = float(
+    os.environ.get("SGLANG_PRIORITY_PIN_DEMOTION_MIN_VALUE", "0.05")
+)
+PRIORITY_DYNAMIC_PIN_DEMOTION_MIN_UTILITY = float(
+    os.environ.get("SGLANG_PRIORITY_DYNAMIC_PIN_DEMOTION_MIN_UTILITY", "0.05")
+)
 
 from sglang.srt.disaggregation.kv_events import (
     MEDIUM_GPU,
@@ -120,6 +135,16 @@ class TreeNode:
         self.cache_pin_expires_at: Optional[float] = None
         self.cache_hint_prefix_key: Optional[str] = None
         self.cache_pin_source: Optional[str] = None
+        self.cache_pin_mode: Optional[str] = None
+        self.cache_hint_agent_type: Optional[str] = None
+        self.cache_hint_motif_id: Optional[str] = None
+        self.cache_hint_stage_id: Optional[str] = None
+        self.cache_pin_utility: float = 0.0
+        self.cache_pin_saved_prefill_ms: float = 0.0
+        self.cache_pin_structure_release_gain_ms: float = 0.0
+        self.cache_pin_expected_queue_saving_ms: float = 0.0
+        self.cache_pin_dynamic: bool = False
+        self.cache_pin_forced_unpin = False
         self.cache_hit_after_pin = 0
 
         self.id = TreeNode.counter if id is None else id
@@ -352,6 +377,16 @@ class RadixCache(BasePrefixCache):
         self.priority_protected_blocks = 0
         self.priority_expired_blocks = 0
         self.priority_evicted_blocks = 0
+        self.priority_pressure_demoted_blocks = 0
+        self.priority_pressure_demotion_events = 0
+        self.pin_demoted_under_pressure_blocks = 0
+        self.pin_demoted_without_pressure_blocks = 0
+        self.forced_unpin_count = 0
+        self.pinned_blocks_total = 0
+        self.pinned_blocks_evicted = 0
+        self.pinned_blocks_evicted_before_reuse = 0
+        self.pinned_blocks_reused = 0
+        self.cold_prefill_tokens_after_eviction = 0
         self.protected_but_not_reused_blocks = 0
         self.evicted_hot_prefix_count = 0
         self.reuse_after_pin_count = 0
@@ -360,6 +395,21 @@ class RadixCache(BasePrefixCache):
         self.reuse_after_pin_node_hits = 0
         self.priority_protected_blocks_by_source = defaultdict(float)
         self.priority_evicted_blocks_by_source = defaultdict(float)
+        self.protected_blocks_by_agent_type = defaultdict(float)
+        self.reuse_tokens_by_agent_type = defaultdict(float)
+        self.protected_but_not_reused_by_agent_type = defaultdict(float)
+        self.priority_evicted_blocks_by_agent_type = defaultdict(float)
+        self.eviction_victim_pin_mode = defaultdict(float)
+        self.eviction_victim_motif_id = defaultdict(float)
+        self.eviction_victim_stage_id = defaultdict(float)
+        self.eviction_reason = defaultdict(float)
+        self.free_blocks_ratio_ema = 0.0
+        self.eviction_rate_ema = 0.0
+        self.free_blocks_ratio_samples = []
+        self.estimated_saved_prefill_ms = 0.0
+        self.actual_cached_prefill_tokens = 0.0
+        self.actual_prefill_tokens = 0.0
+        self._last_eviction_sample_time = None
         self.evictable_leaves.clear()
         self._record_all_cleared_event()
 
@@ -437,10 +487,17 @@ class RadixCache(BasePrefixCache):
         value, last_node, matched_nodes = self._match_prefix_helper(self.root_node, key)
         pinned_token_hits = 0
         pinned_node_hits = 0
+        agent_hits = defaultdict(float)
+        saved_prefill_ms = 0.0
         for matched_node in matched_nodes:
             if matched_node.effective_priority() > 0:
                 pinned_node_hits += 1
-                pinned_token_hits += self._node_value_len(matched_node)
+                node_tokens = self._node_value_len(matched_node)
+                pinned_token_hits += node_tokens
+                agent_hits[self._agent_bucket(matched_node)] += node_tokens
+                saved_prefill_ms += float(
+                    getattr(matched_node, "cache_pin_saved_prefill_ms", 0.0) or 0.0
+                )
                 matched_node.cache_hit_after_pin += 1
         if last_node is not self.root_node and last_node.effective_priority() > 0:
             self.reuse_after_pin_count += 1
@@ -448,6 +505,11 @@ class RadixCache(BasePrefixCache):
             self.reuse_after_pin_events += 1
             self.reuse_after_pin_tokens += pinned_token_hits
             self.reuse_after_pin_node_hits += pinned_node_hits
+            self.pinned_blocks_reused += pinned_token_hits
+            self.actual_cached_prefill_tokens += pinned_token_hits
+            self.estimated_saved_prefill_ms += saved_prefill_ms
+            for agent_type, token_count in agent_hits.items():
+                self.reuse_tokens_by_agent_type[agent_type] += token_count
         if value:
             value = torch.cat(value)
         else:
@@ -479,6 +541,7 @@ class RadixCache(BasePrefixCache):
             params.cache_pin_expires_at,
             params.cache_hint_prefix_key,
             params.cache_pin_ranges,
+            params.cache_pin_metadata,
         )
         return InsertResult(prefix_len=prefix_len)
 
@@ -501,6 +564,24 @@ class RadixCache(BasePrefixCache):
         if not isinstance(ranges, list):
             return []
         return [row for row in ranges if isinstance(row, dict)]
+
+    @staticmethod
+    def _cache_pin_metadata_for_req(req: Req) -> dict[str, str]:
+        ranges = RadixCache._cache_pin_ranges_for_req(req)
+        pin_mode = getattr(req, "cache_hint_pin_mode", None)
+        if not pin_mode:
+            pin_mode = "layered_static" if ranges else "request_soft_priority"
+        return {
+            "pin_mode": str(pin_mode),
+            "motif_id": str(getattr(req, "cache_hint_motif_id", None) or "unknown"),
+            "stage_id": str(getattr(req, "cache_hint_stage_id", None) or "unknown"),
+            "agent_type": str(getattr(req, "cache_hint_agent_type", None) or "unknown"),
+            "saved_prefill_ms": float(
+                getattr(req, "cache_hint_saved_prefill_ms", None)
+                or getattr(req, "cache_priority", 0.0)
+                or 0.0
+            ),
+        }
 
     def _page_align_keys(self, key: list) -> list:
         if self.page_size == 1:
@@ -545,6 +626,7 @@ class RadixCache(BasePrefixCache):
                     cache_pin_expires_at=self._cache_pin_expires_at_for_req(req),
                     cache_hint_prefix_key=getattr(req, "cache_hint_prefix_key", None),
                     cache_pin_ranges=cache_pin_ranges,
+                    cache_pin_metadata=self._cache_pin_metadata_for_req(req),
                 )
             )
             new_prefix_len = result.prefix_len
@@ -593,6 +675,7 @@ class RadixCache(BasePrefixCache):
                 cache_pin_expires_at=self._cache_pin_expires_at_for_req(req),
                 cache_hint_prefix_key=getattr(req, "cache_hint_prefix_key", None),
                 cache_pin_ranges=self._cache_pin_ranges_for_req(req),
+                cache_pin_metadata=self._cache_pin_metadata_for_req(req),
             )
         )
         new_prefix_len = result.prefix_len
@@ -648,6 +731,8 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
+        self._maybe_demote_low_value_request_pins(num_tokens)
+        self._sample_eviction_pressure(num_tokens, 0, start_time)
         leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -659,14 +744,34 @@ class RadixCache(BasePrefixCache):
             _priority, x = heapq.heappop(eviction_heap)
             if x.priority > 0:
                 source = str(getattr(x, "cache_pin_source", None) or "request")
+                node_tokens = len(x.value)
+                pin_mode = str(getattr(x, "cache_pin_mode", None) or source)
+                agent_type = self._agent_bucket(x)
+                motif_id = str(getattr(x, "cache_hint_motif_id", None) or "unknown")
+                stage_id = str(getattr(x, "cache_hint_stage_id", None) or "unknown")
+                self.pinned_blocks_evicted += node_tokens
+                self.eviction_victim_pin_mode[pin_mode] += node_tokens
+                self.priority_evicted_blocks_by_agent_type[agent_type] += node_tokens
+                self.eviction_victim_motif_id[motif_id] += node_tokens
+                self.eviction_victim_stage_id[stage_id] += node_tokens
                 if x.effective_priority() <= 0:
-                    self.priority_expired_blocks += len(x.value)
+                    self.priority_expired_blocks += node_tokens
+                    reason = (
+                        "forced_unpin"
+                        if getattr(x, "cache_pin_forced_unpin", False)
+                        else "ttl_expired"
+                    )
+                    self.eviction_reason[reason] += node_tokens
                 else:
-                    self.priority_evicted_blocks += len(x.value)
-                    self.priority_evicted_blocks_by_source[source] += len(x.value)
+                    self.priority_evicted_blocks += node_tokens
+                    self.priority_evicted_blocks_by_source[source] += node_tokens
                     self.evicted_hot_prefix_count += 1
+                    self.eviction_reason["memory_pressure"] += node_tokens
                 if x.cache_hit_after_pin <= 0:
-                    self.protected_but_not_reused_blocks += len(x.value)
+                    self.protected_but_not_reused_blocks += node_tokens
+                    self.pinned_blocks_evicted_before_reuse += node_tokens
+                    self.protected_but_not_reused_by_agent_type[agent_type] += node_tokens
+                self.cold_prefill_tokens_after_eviction += node_tokens
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
@@ -679,6 +784,7 @@ class RadixCache(BasePrefixCache):
             self._record_remove_event(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
+        self._sample_eviction_pressure(num_tokens, num_evicted, time.perf_counter())
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def inc_lock_ref(self, node: TreeNode):
@@ -726,7 +832,54 @@ class RadixCache(BasePrefixCache):
         total_protected = float(self.priority_protected_blocks or 0)
         source_protected = dict(self.priority_protected_blocks_by_source)
         source_evicted = dict(self.priority_evicted_blocks_by_source)
+        agent_protected = dict(self.protected_blocks_by_agent_type)
+        agent_reuse = dict(self.reuse_tokens_by_agent_type)
+        agent_not_reused = dict(self.protected_but_not_reused_by_agent_type)
+        agent_evicted = dict(self.priority_evicted_blocks_by_agent_type)
+        free_ratio_avg = (
+            sum(self.free_blocks_ratio_samples) / len(self.free_blocks_ratio_samples)
+            if self.free_blocks_ratio_samples
+            else self._free_blocks_ratio()
+        )
+        free_ratio_p5 = (
+            self._percentile(self.free_blocks_ratio_samples, 0.05)
+            if self.free_blocks_ratio_samples
+            else self._free_blocks_ratio()
+        )
         return {
+            "pinned_blocks_total": float(self.pinned_blocks_total),
+            "pinned_blocks_evicted": float(self.pinned_blocks_evicted),
+            "pinned_blocks_evicted_before_reuse": float(
+                self.pinned_blocks_evicted_before_reuse
+            ),
+            "pinned_blocks_reused": float(self.pinned_blocks_reused),
+            "pinned_blocks_not_reused": float(
+                max(0.0, self.pinned_blocks_total - self.pinned_blocks_reused)
+            ),
+            "pinned_evicted_before_reuse_rate": (
+                float(self.pinned_blocks_evicted_before_reuse)
+                / float(self.pinned_blocks_total)
+                if self.pinned_blocks_total > 0.0
+                else 0.0
+            ),
+            "eviction_victim_pin_mode": dict(self.eviction_victim_pin_mode),
+            "eviction_victim_motif_id": dict(self.eviction_victim_motif_id),
+            "eviction_victim_stage_id": dict(self.eviction_victim_stage_id),
+            "eviction_reason": dict(self.eviction_reason),
+            "free_blocks_ratio_ema": float(self.free_blocks_ratio_ema),
+            "free_blocks_ratio_avg": float(free_ratio_avg),
+            "free_blocks_ratio_p5": float(free_ratio_p5),
+            "eviction_rate_ema": float(self.eviction_rate_ema),
+            "cold_prefill_tokens_after_eviction": float(
+                self.cold_prefill_tokens_after_eviction
+            ),
+            "actual_prefill_tokens": float(self.actual_prefill_tokens),
+            "actual_cached_prefill_tokens": float(self.actual_cached_prefill_tokens),
+            "actual_recomputed_prefill_tokens": float(
+                max(0.0, self.actual_prefill_tokens - self.actual_cached_prefill_tokens)
+            ),
+            "estimated_saved_prefill_ms": float(self.estimated_saved_prefill_ms),
+            "forced_unpin_count": float(self.forced_unpin_count),
             "protected_but_not_reused_blocks": float(self.protected_but_not_reused_blocks),
             "evicted_hot_prefix_count": float(self.evicted_hot_prefix_count),
             "reuse_after_pin_rate": (
@@ -746,6 +899,18 @@ class RadixCache(BasePrefixCache):
             "priority_protected_blocks": total_protected,
             "priority_expired_blocks": float(self.priority_expired_blocks),
             "priority_evicted_blocks": float(self.priority_evicted_blocks),
+            "priority_pressure_demoted_blocks": float(
+                self.priority_pressure_demoted_blocks
+            ),
+            "priority_pressure_demotion_events": float(
+                self.priority_pressure_demotion_events
+            ),
+            "pin_demoted_under_pressure_blocks": float(
+                self.pin_demoted_under_pressure_blocks
+            ),
+            "pin_demoted_without_pressure_blocks": float(
+                self.pin_demoted_without_pressure_blocks
+            ),
             "priority_request_protected_blocks": float(source_protected.get("request", 0.0)),
             "priority_reuse_protected_blocks": float(source_protected.get("reuse", 0.0)),
             "priority_release_protected_blocks": float(source_protected.get("release", 0.0)),
@@ -754,6 +919,18 @@ class RadixCache(BasePrefixCache):
             "priority_reuse_evicted_blocks": float(source_evicted.get("reuse", 0.0)),
             "priority_release_evicted_blocks": float(source_evicted.get("release", 0.0)),
             "priority_range_evicted_blocks": float(source_evicted.get("range", 0.0)),
+            "protected_blocks_by_react": float(agent_protected.get("react", 0.0)),
+            "protected_blocks_by_motif": float(agent_protected.get("motif", 0.0)),
+            "protected_blocks_by_unknown": float(agent_protected.get("unknown", 0.0)),
+            "reuse_tokens_by_react": float(agent_reuse.get("react", 0.0)),
+            "reuse_tokens_by_motif": float(agent_reuse.get("motif", 0.0)),
+            "reuse_tokens_by_unknown": float(agent_reuse.get("unknown", 0.0)),
+            "protected_but_not_reused_by_react": float(agent_not_reused.get("react", 0.0)),
+            "protected_but_not_reused_by_motif": float(agent_not_reused.get("motif", 0.0)),
+            "protected_but_not_reused_by_unknown": float(agent_not_reused.get("unknown", 0.0)),
+            "priority_evicted_blocks_by_react": float(agent_evicted.get("react", 0.0)),
+            "priority_evicted_blocks_by_motif": float(agent_evicted.get("motif", 0.0)),
+            "priority_evicted_blocks_by_unknown": float(agent_evicted.get("unknown", 0.0)),
         }
 
     def available_and_evictable_str(self) -> str:
@@ -765,6 +942,107 @@ class RadixCache(BasePrefixCache):
             + ", ".join(f"{key}={value}" for key, value in stats.items())
             + "\n"
         )
+
+    def _maybe_demote_low_value_request_pins(self, requested_tokens: int) -> None:
+        if (
+            not PRIORITY_PIN_PRESSURE_DEMOTION
+            or self.eviction_policy != "priority"
+            or requested_tokens <= 0
+            or self.evictable_size_ <= 0
+        ):
+            return
+
+        pressure = float(requested_tokens) / max(1.0, float(self.evictable_size_))
+        threshold = max(0.0, float(PRIORITY_PIN_DEMOTION_PRESSURE_FRACTION or 0.0))
+        if pressure < threshold:
+            return
+
+        min_value = max(0.0, float(PRIORITY_PIN_DEMOTION_MIN_VALUE or 0.0))
+        if min_value <= 0.0:
+            return
+
+        now = time.monotonic()
+        demoted_blocks = 0
+        for node in self._iter_tree_nodes(self.root_node):
+            if node is self.root_node or node.evicted:
+                continue
+            pin_mode = str(getattr(node, "cache_pin_mode", None) or "")
+            source = str(getattr(node, "cache_pin_source", None) or "")
+            dynamic_guarded = pin_mode in {
+                "generic_layered_dynamic",
+                "motif_layered_dynamic",
+                "request_soft_priority_guarded",
+            } or bool(getattr(node, "cache_pin_dynamic", False))
+            if source != "request" and not dynamic_guarded:
+                continue
+            if node.effective_priority(now) <= 0.0:
+                continue
+            block_count = max(1, self._node_value_len(node))
+            hit_count = max(0, int(getattr(node, "cache_hit_after_pin", 0) or 0))
+            marginal_value = node.effective_priority(now) * (1.0 + hit_count)
+            marginal_value /= float(block_count)
+            threshold = (
+                max(min_value, PRIORITY_DYNAMIC_PIN_DEMOTION_MIN_UTILITY)
+                if dynamic_guarded
+                else min_value
+            )
+            if marginal_value >= threshold:
+                continue
+            node.cache_pin_expires_at = now - 1e-6
+            node.cache_pin_forced_unpin = True
+            demoted_blocks += block_count
+
+        if demoted_blocks > 0:
+            self.priority_pressure_demoted_blocks += demoted_blocks
+            self.priority_pressure_demotion_events += 1
+            self.pin_demoted_under_pressure_blocks += demoted_blocks
+            self.forced_unpin_count += 1
+
+    def _free_blocks_ratio(self) -> float:
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        try:
+            available = float(allocator.available_size())
+            total = float(getattr(allocator, "size", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+        return max(0.0, min(1.0, available / total)) if total > 0.0 else 0.0
+
+    def _sample_eviction_pressure(
+        self, requested_tokens: int, evicted_tokens: int, now: float
+    ) -> None:
+        ratio = self._free_blocks_ratio()
+        self.free_blocks_ratio_samples.append(ratio)
+        if len(self.free_blocks_ratio_samples) > 4096:
+            self.free_blocks_ratio_samples = self.free_blocks_ratio_samples[-4096:]
+        alpha = 0.2
+        if self.free_blocks_ratio_ema <= 0.0:
+            self.free_blocks_ratio_ema = ratio
+        else:
+            self.free_blocks_ratio_ema = alpha * ratio + (1.0 - alpha) * self.free_blocks_ratio_ema
+
+        last = self._last_eviction_sample_time
+        self._last_eviction_sample_time = now
+        if last is None:
+            return
+        dt = max(1e-6, float(now) - float(last))
+        rate = float(evicted_tokens if evicted_tokens > 0 else requested_tokens) / dt
+        if self.eviction_rate_ema <= 0.0:
+            self.eviction_rate_ema = rate
+        else:
+            self.eviction_rate_ema = alpha * rate + (1.0 - alpha) * self.eviction_rate_ema
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = int(max(0, min(len(ordered) - 1, round(percentile * (len(ordered) - 1)))))
+        return float(ordered[index])
+
+    def _iter_tree_nodes(self, node: TreeNode) -> Iterator[TreeNode]:
+        yield node
+        for child in list(node.children.values()):
+            yield from self._iter_tree_nodes(child)
 
     def all_values_flatten(self):
         values = []
@@ -815,6 +1093,10 @@ class RadixCache(BasePrefixCache):
         new_node.cache_pin_expires_at = child.cache_pin_expires_at
         new_node.cache_hint_prefix_key = child.cache_hint_prefix_key
         new_node.cache_pin_source = child.cache_pin_source
+        new_node.cache_pin_mode = child.cache_pin_mode
+        new_node.cache_hint_motif_id = child.cache_hint_motif_id
+        new_node.cache_hint_stage_id = child.cache_hint_stage_id
+        new_node.cache_pin_forced_unpin = child.cache_pin_forced_unpin
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -839,6 +1121,7 @@ class RadixCache(BasePrefixCache):
         cache_pin_expires_at: Optional[float],
         cache_hint_prefix_key: Optional[str],
         cache_pin_source: str = "request",
+        cache_pin_metadata: Optional[dict[str, Any]] = None,
     ):
         priority = max(0.0, float(priority or 0.0))
         if priority <= 0.0:
@@ -849,10 +1132,75 @@ class RadixCache(BasePrefixCache):
                 node_tokens = self._node_value_len(node)
                 self.priority_protected_blocks += node_tokens
                 self.priority_protected_blocks_by_source[cache_pin_source] += node_tokens
+                self.protected_blocks_by_agent_type[self._agent_bucket_from_metadata(cache_pin_metadata)] += node_tokens
+                self.pinned_blocks_total += node_tokens
             node.priority = priority
+            node.cache_pin_utility = priority
             node.cache_pin_expires_at = cache_pin_expires_at
             node.cache_hint_prefix_key = cache_hint_prefix_key
             node.cache_pin_source = cache_pin_source
+            self._apply_cache_pin_metadata(node, cache_pin_metadata)
+
+    @staticmethod
+    def _apply_cache_pin_metadata(
+        node: TreeNode, cache_pin_metadata: Optional[dict[str, Any]]
+    ) -> None:
+        if not isinstance(cache_pin_metadata, dict):
+            return
+        pin_mode = cache_pin_metadata.get("pin_mode")
+        motif_id = cache_pin_metadata.get("motif_id")
+        stage_id = cache_pin_metadata.get("stage_id")
+        agent_type = cache_pin_metadata.get("agent_type")
+        if isinstance(pin_mode, str) and pin_mode:
+            node.cache_pin_mode = pin_mode
+        if isinstance(motif_id, str) and motif_id:
+            node.cache_hint_motif_id = motif_id
+        if isinstance(stage_id, str) and stage_id:
+            node.cache_hint_stage_id = stage_id
+        if isinstance(agent_type, str) and agent_type:
+            node.cache_hint_agent_type = agent_type
+        for key, attr in (
+            ("saved_prefill_ms", "cache_pin_saved_prefill_ms"),
+            ("expected_queue_saving_ms", "cache_pin_expected_queue_saving_ms"),
+            ("structure_release_gain_ms", "cache_pin_structure_release_gain_ms"),
+            ("utility", "cache_pin_utility"),
+        ):
+            value = cache_pin_metadata.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                setattr(node, attr, max(0.0, float(value)))
+        if bool(cache_pin_metadata.get("pin_dynamic")):
+            node.cache_pin_dynamic = True
+
+    @staticmethod
+    def _agent_bucket_from_metadata(cache_pin_metadata: Optional[dict[str, Any]]) -> str:
+        if not isinstance(cache_pin_metadata, dict):
+            return "unknown"
+        value = str(cache_pin_metadata.get("agent_type") or "").lower()
+        motif_id = str(cache_pin_metadata.get("motif_id") or "").lower()
+        stage_id = str(cache_pin_metadata.get("stage_id") or "").lower()
+        call_type = str(cache_pin_metadata.get("call_type") or "").lower()
+        joined = " ".join((value, motif_id, stage_id, call_type))
+        if "react" in joined:
+            return "react"
+        if motif_id and motif_id not in {"unknown", "none", "react"}:
+            return "motif"
+        if value in {"motif", "appworld_motif", "structured_motif"}:
+            return "motif"
+        return "unknown"
+
+    @staticmethod
+    def _agent_bucket(node: TreeNode) -> str:
+        value = str(getattr(node, "cache_hint_agent_type", None) or "").lower()
+        motif_id = str(getattr(node, "cache_hint_motif_id", None) or "").lower()
+        stage_id = str(getattr(node, "cache_hint_stage_id", None) or "").lower()
+        joined = " ".join((value, motif_id, stage_id))
+        if "react" in joined:
+            return "react"
+        if motif_id and motif_id not in {"unknown", "none", "react"}:
+            return "motif"
+        if value in {"motif", "appworld_motif", "structured_motif"}:
+            return "motif"
+        return "unknown"
 
     def _normalize_cache_pin_ranges(
         self,
@@ -893,6 +1241,10 @@ class RadixCache(BasePrefixCache):
                     "priority": priority,
                     "expires_at": expires_at,
                     "source": str(item.get("source") or "range"),
+                    "pin_dynamic": bool(item.get("pin_dynamic")),
+                    "saved_prefill_ms": float(item.get("saved_prefill_ms") or 0.0),
+                    "expected_queue_saving_ms": float(item.get("expected_queue_saving_ms") or 0.0),
+                    "structure_release_gain_ms": float(item.get("structure_release_gain_ms") or 0.0),
                 }
             )
         return cleaned
@@ -925,6 +1277,7 @@ class RadixCache(BasePrefixCache):
         ranges: list[dict[str, Any]],
         fallback_expires_at: Optional[float],
         cache_hint_prefix_key: Optional[str],
+        cache_pin_metadata: Optional[dict[str, Any]],
     ) -> None:
         cleaned = self._normalize_cache_pin_ranges(
             ranges, len(key), fallback_expires_at
@@ -956,6 +1309,14 @@ class RadixCache(BasePrefixCache):
                 best["expires_at"],
                 cache_hint_prefix_key,
                 cache_pin_source=best["source"],
+                cache_pin_metadata={
+                    **(cache_pin_metadata or {}),
+                    "pin_dynamic": best.get("pin_dynamic", False),
+                    "saved_prefill_ms": best.get("saved_prefill_ms", 0.0),
+                    "expected_queue_saving_ms": best.get("expected_queue_saving_ms", 0.0),
+                    "structure_release_gain_ms": best.get("structure_release_gain_ms", 0.0),
+                    "utility": best["priority"],
+                },
             )
 
     @staticmethod
@@ -977,6 +1338,7 @@ class RadixCache(BasePrefixCache):
         cache_pin_expires_at: Optional[float] = None,
         cache_hint_prefix_key: Optional[str] = None,
         cache_pin_ranges: Optional[list[dict[str, Any]]] = None,
+        cache_pin_metadata: Optional[dict[str, Any]] = None,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -985,7 +1347,13 @@ class RadixCache(BasePrefixCache):
         access_time = time.monotonic()
         node.last_access_time = access_time
         # Update priority along the path so shared ancestors are protected too.
-        self._apply_priority_hint(node, priority, cache_pin_expires_at, cache_hint_prefix_key)
+        self._apply_priority_hint(
+            node,
+            priority,
+            cache_pin_expires_at,
+            cache_hint_prefix_key,
+            cache_pin_metadata=cache_pin_metadata,
+        )
         if len(key) == 0:
             return 0
 
@@ -1003,12 +1371,20 @@ class RadixCache(BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 self._apply_priority_hint(
-                    new_node, priority, cache_pin_expires_at, cache_hint_prefix_key
+                    new_node,
+                    priority,
+                    cache_pin_expires_at,
+                    cache_hint_prefix_key,
+                    cache_pin_metadata=cache_pin_metadata,
                 )
                 node = new_node
             else:
                 self._apply_priority_hint(
-                    node, priority, cache_pin_expires_at, cache_hint_prefix_key
+                    node,
+                    priority,
+                    cache_pin_expires_at,
+                    cache_hint_prefix_key,
+                    cache_pin_metadata=cache_pin_metadata,
                 )
 
             if len(key):
@@ -1019,6 +1395,7 @@ class RadixCache(BasePrefixCache):
             new_node.cache_pin_expires_at = cache_pin_expires_at
             new_node.cache_hint_prefix_key = cache_hint_prefix_key
             new_node.cache_pin_source = "request" if priority > 0.0 else None
+            self._apply_cache_pin_metadata(new_node, cache_pin_metadata)
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
@@ -1026,6 +1403,11 @@ class RadixCache(BasePrefixCache):
                 node_tokens = self._node_value_len(new_node)
                 self.priority_protected_blocks += node_tokens
                 self.priority_protected_blocks_by_source["request"] += node_tokens
+                self.protected_blocks_by_agent_type[
+                    self._agent_bucket_from_metadata(cache_pin_metadata)
+                ] += node_tokens
+                self.pinned_blocks_total += node_tokens
+                self.actual_prefill_tokens += node_tokens
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
@@ -1038,6 +1420,7 @@ class RadixCache(BasePrefixCache):
                 cache_pin_ranges,
                 fallback_expires_at=cache_pin_expires_at,
                 cache_hint_prefix_key=cache_hint_prefix_key,
+                cache_pin_metadata=cache_pin_metadata,
             )
         return total_prefix_length
 

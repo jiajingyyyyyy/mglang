@@ -620,11 +620,19 @@ class Req(ReqDllmMixin):
         self.cache_hint_prefix_key = (
             getattr(structured_hints, "prefix_key", None) if structured_hints else None
         )
+        self.cache_hint_pin_mode = (
+            getattr(structured_hints, "cache_pin_mode", None) if structured_hints else None
+        )
         self.cache_hint_motif_id = (
             getattr(structured_hints, "motif_id", None) if structured_hints else None
         )
         self.cache_hint_stage_id = (
             getattr(structured_hints, "stage_id", None) if structured_hints else None
+        )
+        self.cache_hint_saved_prefill_ms = (
+            getattr(structured_hints, "saved_prefill_cost_ms", None)
+            if structured_hints
+            else None
         )
         self.cache_hint_agent_type = (
             getattr(structured_hints, "agent_type", None) if structured_hints else None
@@ -922,10 +930,24 @@ class Req(ReqDllmMixin):
                     row["cache_pin_ttl_ms"] = max(0.0, float(ttl_ms))
                 except (TypeError, ValueError):
                     pass
-            for key in ("source", "level", "prefix_hash"):
+            for key in (
+                "source",
+                "level",
+                "prefix_hash",
+                "pin_dynamic",
+                "kv_blocks",
+                "saved_prefill_ms",
+                "expected_queue_saving_ms",
+                "structure_release_gain_ms",
+                "reuse_probability",
+            ):
                 value = item.get(key)
                 if isinstance(value, str) and value:
                     row[key] = value
+                elif isinstance(value, bool):
+                    row[key] = value
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    row[key] = float(value)
             cleaned.append(row)
         return cleaned
 

@@ -16,6 +16,7 @@ class TestStructuredRequestHints(unittest.TestCase):
                 "prefix_key": "prefix-a",
                 "decode_class": "open_world",
                 "deadline_ms": 25,
+                "cache_pin_mode": "layered_static",
                 "ignored": "value",
             },
         )
@@ -27,6 +28,7 @@ class TestStructuredRequestHints(unittest.TestCase):
         self.assertEqual(hints.prefix_key, "prefix-a")
         self.assertEqual(hints.decode_class, "open_world")
         self.assertEqual(hints.deadline_ms, 25.0)
+        self.assertEqual(hints.cache_pin_mode, "layered_static")
         self.assertFalse(hasattr(hints, "ignored"))
 
     def test_completion_request_accepts_metadata_fallback(self):

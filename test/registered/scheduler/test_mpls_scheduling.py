@@ -16,6 +16,7 @@ def _req(
     arrival=1.0,
     latest_start_ms=500.0,
     internal_latest_start_ms=None,
+    deadline_ms=None,
     release_credit=None,
     static_prefix_len=None,
     saved_prefill_cost_ms=None,
@@ -29,6 +30,7 @@ def _req(
             prefix_ladder=ladder,
             latest_start_ms=latest_start_ms,
             internal_latest_start_ms=internal_latest_start_ms,
+            deadline_ms=deadline_ms,
             downstream_release_credit=release_credit,
             static_prefix_len=static_prefix_len,
             saved_prefill_cost_ms=saved_prefill_cost_ms,
@@ -51,6 +53,17 @@ class TestMplsScheduling(unittest.TestCase):
         )
         self.assertEqual(policy.policy, CacheAwarePolicy.MPLS)
         return policy
+
+    def test_mpls_slo_alias_uses_mpls_policy_path(self):
+        policy = SchedulePolicy(
+            "mpls_slo",
+            RadixCache.create_simulated(),
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+        self.assertEqual(policy.policy, CacheAwarePolicy.MPLS_SLO)
 
     def test_mpls_selects_prefix_gain_inside_lag_frontier(self):
         long_ladder = [
@@ -125,6 +138,99 @@ class TestMplsScheduling(unittest.TestCase):
         stats = policy.get_mpls_stats()
         self.assertEqual(stats["selected_release_gain_ms_avg"], 250.0)
         self.assertEqual(stats["selected_total_gain_ms_avg"], 250.0)
+
+    def test_mpls_slo_tier_promotes_critical_feasible_request(self):
+        local_ladder = [
+            {"level": "stage", "prefix_hash": "local", "prefix_len": 100}
+        ]
+        urgent_ladder = [
+            {"level": "stage", "prefix_hash": "urgent", "prefix_len": 10}
+        ]
+        waiting_queue = [
+            _req(
+                "local-0",
+                [1, 10],
+                ladder=local_ladder,
+                deadline_ms=500,
+            ),
+            _req(
+                "local-1",
+                [1, 11],
+                ladder=local_ladder,
+                deadline_ms=500,
+            ),
+            _req(
+                "urgent",
+                [2, 20],
+                ladder=urgent_ladder,
+                deadline_ms=100,
+            ),
+        ]
+
+        patches = [
+            patch(
+                "sglang.srt.managers.schedule_policy."
+                "MPLS_SLO_SERVICE_MS_PER_TOKEN",
+                0.1,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_policy."
+                "MPLS_SLO_CRITICAL_SLACK_MS",
+                100.0,
+            ),
+        ]
+        with patches[0], patches[1], patch(
+            "sglang.srt.managers.schedule_policy.time.perf_counter",
+            return_value=1.05,
+        ):
+            policy = self._policy()
+            policy.calc_priority(waiting_queue)
+
+        self.assertEqual(waiting_queue[0].rid, "urgent")
+        stats = policy.get_mpls_stats()
+        self.assertGreater(stats["slo_critical_feasible_candidate_rate"], 0.0)
+
+    def test_mpls_slo_tier_demotes_hopeless_request(self):
+        hopeless_ladder = [
+            {"level": "stage", "prefix_hash": "hopeless", "prefix_len": 100}
+        ]
+        feasible_ladder = [
+            {"level": "stage", "prefix_hash": "feasible", "prefix_len": 10}
+        ]
+        waiting_queue = [
+            _req(
+                "hopeless-0",
+                [1, 10],
+                ladder=hopeless_ladder,
+                deadline_ms=10,
+            ),
+            _req(
+                "hopeless-1",
+                [1, 11],
+                ladder=hopeless_ladder,
+                deadline_ms=10,
+            ),
+            _req(
+                "feasible",
+                [2, 20],
+                ladder=feasible_ladder,
+                deadline_ms=500,
+            ),
+        ]
+
+        with patch(
+            "sglang.srt.managers.schedule_policy.MPLS_SLO_SERVICE_MS_PER_TOKEN",
+            0.1,
+        ), patch(
+            "sglang.srt.managers.schedule_policy.time.perf_counter",
+            return_value=1.2,
+        ):
+            policy = self._policy()
+            policy.calc_priority(waiting_queue)
+
+        self.assertEqual(waiting_queue[0].rid, "feasible")
+        stats = policy.get_mpls_stats()
+        self.assertGreater(stats["slo_hopeless_candidate_rate"], 0.0)
 
     def test_mpls_internal_deadline_overrides_generic_latest_start(self):
         urgent_ladder = [

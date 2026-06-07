@@ -128,6 +128,26 @@ MPLS_DIRECT_RELEASE_WEIGHT = float(
 MPLS_IMMINENT_UNLOCK_WEIGHT = float(
     os.environ.get("SGLANG_MPLS_IMMINENT_UNLOCK_WEIGHT", "0.0")
 )
+MPLS_SLO_TIERING = get_bool_env_var("SGLANG_MPLS_SLO_TIERING", "true")
+MPLS_SLO_CRITICAL_SLACK_MS = float(
+    os.environ.get("SGLANG_MPLS_SLO_CRITICAL_SLACK_MS", "500")
+)
+MPLS_SLO_HOPELESS_GRACE_MS = float(
+    os.environ.get("SGLANG_MPLS_SLO_HOPELESS_GRACE_MS", "0")
+)
+MPLS_SLO_SERVICE_MS_PER_TOKEN = float(
+    os.environ.get("SGLANG_MPLS_SLO_SERVICE_MS_PER_TOKEN", "1.0")
+)
+MPLS_SLO_EPS_MS = float(os.environ.get("SGLANG_MPLS_SLO_EPS_MS", "1.0"))
+MPLS_STRUCTURE_SAFE_MARGIN_MS = float(
+    os.environ.get("SGLANG_MPLS_STRUCTURE_SAFE_MARGIN_MS", "5000")
+)
+MPLS_STRUCTURE_GAIN_PER_SERVICE_MIN = float(
+    os.environ.get("SGLANG_MPLS_STRUCTURE_GAIN_PER_SERVICE_MIN", "0.01")
+)
+MPLS_PIN_PRESSURE_FREE_RATIO_THRESHOLD = float(
+    os.environ.get("SGLANG_MPLS_PIN_PRESSURE_FREE_RATIO_THRESHOLD", "0.05")
+)
 logger = logging.getLogger(__name__)
 
 # Copyright 2023-2024 SGLang Team
@@ -208,6 +228,8 @@ class CacheAwarePolicy(Enum):
     SEMANTIC_SLO_COST_DFS = "semantic-slo-cost-dfs"  # motif semantic overlay over SLO/cost prefix DFS
     SLO_PREFIX_MIXED_DFS = "slo-prefix-mixed-dfs"  # bounded SLO slice over DFS
     MPLS = "mpls"  # deadline-guarded motif prefix lease scheduling
+    MPLS_SLO = "mpls_slo"  # MPLS alias with SLO tiering enabled by default
+    STRUCTURE_INFORMED_SLO = "structure-informed-slo"  # motif-progress SLO feasibility over MPLS
 
 
 class CacheAgnosticPolicy(Enum):
@@ -295,6 +317,16 @@ class SchedulePolicy:
             elif policy == CacheAwarePolicy.SLO_PREFIX_MIXED_DFS:
                 self._sort_by_slo_prefix_mixed_dfs(waiting_queue, self.tree_cache)
             elif policy == CacheAwarePolicy.MPLS:
+                SchedulePolicy._sort_by_mpls(
+                    waiting_queue,
+                    temporary_deprioritized,
+                    self.mpls_stats,
+                    tree_cache=self.tree_cache,
+                )
+            elif policy in (
+                CacheAwarePolicy.MPLS_SLO,
+                CacheAwarePolicy.STRUCTURE_INFORMED_SLO,
+            ):
                 SchedulePolicy._sort_by_mpls(
                     waiting_queue,
                     temporary_deprioritized,
@@ -482,12 +514,16 @@ class SchedulePolicy:
         if mpls_stats is not None:
             mpls_stats["calls"] += 1
             mpls_stats["waiting_req_count_total"] += len(waiting_queue)
+            SchedulePolicy._apply_pin_lease_guard(tree_cache, waiting_queue, mpls_stats, now)
 
         if tree_cache is not None and all(
             getattr(req, "last_node", None) is not None for req in waiting_queue
+        ) and any(
+            getattr(req, "last_node", None) is not getattr(tree_cache, "root_node", None)
+            for req in waiting_queue
         ):
             SchedulePolicy._sort_by_mpls_dfs_overlay(
-                waiting_queue, tree_cache, mpls_stats
+                waiting_queue, tree_cache, mpls_stats, now=now
             )
             return
 
@@ -524,6 +560,9 @@ class SchedulePolicy:
                 mpls_stats["fallback_dfs_count"] += 1
             SchedulePolicy._mpls_sort_by_base_dfs(
                 waiting_queue, tree_cache, temporary_deprioritized
+            )
+            SchedulePolicy._apply_mpls_slo_tiers(
+                waiting_queue, ready_prefix_index, mpls_stats, now
             )
             return
 
@@ -582,6 +621,9 @@ class SchedulePolicy:
                 mpls_stats["fallback_dfs_count"] += 1
             SchedulePolicy._mpls_sort_by_base_dfs(
                 waiting_queue, tree_cache, temporary_deprioritized
+            )
+            SchedulePolicy._apply_mpls_slo_tiers(
+                waiting_queue, ready_prefix_index, mpls_stats, now
             )
             return
 
@@ -645,6 +687,9 @@ class SchedulePolicy:
                 SchedulePolicy._mpls_sort_by_base_dfs(
                     waiting_queue, tree_cache, temporary_deprioritized
                 )
+                SchedulePolicy._apply_mpls_slo_tiers(
+                    waiting_queue, ready_prefix_index, mpls_stats, now
+                )
                 return
 
         selected_ids = {id(req) for _index, req in selected["reqs"]}
@@ -661,9 +706,15 @@ class SchedulePolicy:
             rest, tree_cache, temporary_deprioritized
         )
         waiting_queue[:] = selected_reqs + rest
+        SchedulePolicy._apply_mpls_slo_tiers(
+            waiting_queue, ready_prefix_index, mpls_stats, now
+        )
         if mpls_stats is not None:
             SchedulePolicy._record_mpls_selection(
                 mpls_stats, selected, selected_reqs, selected_expired
+            )
+            SchedulePolicy._record_mpls_slo_selected_stats(
+                mpls_stats, waiting_queue[0], ready_prefix_index, now
             )
 
     @staticmethod
@@ -671,7 +722,9 @@ class SchedulePolicy:
         waiting_queue: List[Req],
         tree_cache: BasePrefixCache,
         mpls_stats: Optional[Dict[str, float]] = None,
+        now: Optional[float] = None,
     ) -> None:
+        now = time.perf_counter() if now is None else now
         ready_prefix_index = SchedulePolicy._mpls_ready_prefix_index(waiting_queue)
         last_node_to_reqs = defaultdict(list)
         node_to_weight = defaultdict(int)
@@ -870,6 +923,9 @@ class SchedulePolicy:
             last_node_to_reqs,
             waiting_queue,
         )
+        SchedulePolicy._apply_mpls_slo_tiers(
+            waiting_queue, ready_prefix_index, mpls_stats, now
+        )
 
         if mpls_stats is not None and waiting_queue:
             selected_req = waiting_queue[0]
@@ -920,6 +976,9 @@ class SchedulePolicy:
                 mpls_stats["selected_with_future_ladder_match_count"] += 1
             if float(selected_info.get("bridge_release_gain_ms") or 0.0) > 0.0:
                 mpls_stats["selected_with_bridge_gain_count"] += 1
+            SchedulePolicy._record_mpls_slo_selected_stats(
+                mpls_stats, selected_req, ready_prefix_index, now
+            )
             mpls_stats["selected_total_gain_ms_total"] += float(
                 selected_info.get("total_gain_ms") or 0.0
             )
@@ -1058,6 +1117,263 @@ class SchedulePolicy:
             mpls_stats[f"{base}dfs_loss_gt_1000_count_total"] += 1.0
 
     @staticmethod
+    def _apply_mpls_slo_tiers(
+        waiting_queue: List[Req],
+        ready_prefix_index: Dict[tuple, dict],
+        mpls_stats: Optional[Dict[str, float]],
+        now: float,
+    ) -> None:
+        if not MPLS_SLO_TIERING or len(waiting_queue) <= 1:
+            return
+
+        annotated = []
+        for index, req in enumerate(waiting_queue):
+            tier = SchedulePolicy._mpls_slo_tier_for_req(
+                req, ready_prefix_index, now
+            )
+            annotated.append((tier, index, req))
+
+        if mpls_stats is not None:
+            for tier, _index, _req in annotated:
+                mpls_stats[f"slo_{tier['name']}_candidate_count_total"] += 1.0
+                if tier.get("pinned_return"):
+                    mpls_stats["pinned_return_ready_count"] += 1.0
+                    wait_ms = max(
+                        0.0,
+                        (now - SchedulePolicy._mpls_arrival_s(_req)) * 1000.0,
+                    )
+                    mpls_stats["pinned_return_wait_ms_total"] += wait_ms
+                    mpls_stats["pinned_return_wait_ms_max"] = max(
+                        float(mpls_stats.get("pinned_return_wait_ms_max") or 0.0),
+                        wait_ms,
+                    )
+                mpls_stats["slo_slack_after_service_s_total"] += float(
+                    tier["slack_after_service_s"]
+                )
+                mpls_stats["slo_estimated_service_s_total"] += float(
+                    tier["estimated_service_s"]
+                )
+
+        original_first = id(waiting_queue[0])
+        annotated.sort(
+            key=lambda item: (
+                item[0]["rank"],
+                item[0]["slack_sort_s"],
+                item[0]["structure_sort"],
+                item[1],
+            )
+        )
+        waiting_queue[:] = [req for _tier, _index, req in annotated]
+        if mpls_stats is not None and id(waiting_queue[0]) != original_first:
+            mpls_stats["slo_tier_promoted_count"] += 1.0
+
+    @staticmethod
+    def _apply_pin_lease_guard(
+        tree_cache: Optional[BasePrefixCache],
+        waiting_queue: List[Req],
+        mpls_stats: Optional[Dict[str, float]],
+        now: float,
+    ) -> None:
+        if tree_cache is None or mpls_stats is None:
+            return
+        iter_nodes = getattr(tree_cache, "_iter_tree_nodes", None)
+        root_node = getattr(tree_cache, "root_node", None)
+        if not callable(iter_nodes) or root_node is None:
+            return
+        ready_prefix_keys = {
+            str(getattr(req, "cache_hint_prefix_key", "") or "")
+            for req in waiting_queue
+            if str(getattr(req, "cache_hint_prefix_key", "") or "")
+        }
+        demoted_expire = 0.0
+        demoted_low_utility = 0.0
+        demoted_under_pressure = 0.0
+        demoted_without_pressure = 0.0
+        demoted_hopeless = 0.0
+        free_ratio_fn = getattr(tree_cache, "_free_blocks_ratio", None)
+        try:
+            free_ratio = (
+                float(free_ratio_fn())
+                if callable(free_ratio_fn)
+                else float(getattr(tree_cache, "free_blocks_ratio_ema", 1.0) or 1.0)
+            )
+        except (TypeError, ValueError):
+            free_ratio = 1.0
+        under_pressure = free_ratio <= max(
+            0.0, float(MPLS_PIN_PRESSURE_FREE_RATIO_THRESHOLD or 0.0)
+        )
+        for node in iter_nodes(root_node):
+            if node is root_node or getattr(node, "evicted", False):
+                continue
+            if getattr(node, "effective_priority", lambda *_args: 0.0)(now) <= 0.0:
+                continue
+            pin_mode = str(getattr(node, "cache_pin_mode", "") or "")
+            dynamic_guarded = pin_mode in {
+                "generic_layered_dynamic",
+                "motif_layered_dynamic",
+                "request_soft_priority_guarded",
+            } or bool(getattr(node, "cache_pin_dynamic", False))
+            if not dynamic_guarded:
+                continue
+            node_tokens = float(SchedulePolicy._cache_node_value_len(node))
+            expires_at = getattr(node, "cache_pin_expires_at", None)
+            if expires_at is not None and now > float(expires_at):
+                demoted_expire += node_tokens
+                continue
+            prefix_key = str(getattr(node, "cache_hint_prefix_key", "") or "")
+            if prefix_key and prefix_key in ready_prefix_keys:
+                continue
+            utility = float(getattr(node, "cache_pin_utility", 0.0) or 0.0)
+            if utility <= 0.0:
+                node.cache_pin_expires_at = now - 1e-6
+                node.cache_pin_forced_unpin = True
+                demoted_low_utility += node_tokens
+                if under_pressure:
+                    demoted_under_pressure += node_tokens
+                else:
+                    demoted_without_pressure += node_tokens
+        if demoted_expire > 0.0:
+            mpls_stats["pin_demoted_due_to_expire"] += demoted_expire
+        if demoted_low_utility > 0.0:
+            mpls_stats["pin_demoted_due_to_low_utility"] += demoted_low_utility
+            if hasattr(tree_cache, "pin_demoted_under_pressure_blocks"):
+                tree_cache.pin_demoted_under_pressure_blocks += demoted_under_pressure
+            if hasattr(tree_cache, "pin_demoted_without_pressure_blocks"):
+                tree_cache.pin_demoted_without_pressure_blocks += demoted_without_pressure
+        if demoted_hopeless > 0.0:
+            mpls_stats["pin_demoted_due_to_hopeless"] += demoted_hopeless
+
+    @staticmethod
+    def _mpls_slo_tier_for_req(
+        req: Req, ready_prefix_index: Dict[tuple, dict], now: float
+    ) -> dict:
+        raw_slack_s = SchedulePolicy._slo_prefix_raw_slack_s(req, now)
+        estimated_service_s = SchedulePolicy._mpls_estimated_remaining_service_s(req)
+        slack_after_service_s = raw_slack_s - estimated_service_s
+        critical_slack_s = max(0.0, float(MPLS_SLO_CRITICAL_SLACK_MS or 0.0)) / 1000.0
+        hopeless_grace_s = max(0.0, float(MPLS_SLO_HOPELESS_GRACE_MS or 0.0)) / 1000.0
+        structure_gain_ms = SchedulePolicy._mpls_req_structure_gain_ms(
+            req, ready_prefix_index
+        )
+        pinned_return = SchedulePolicy._req_has_active_pin_hit(req, now)
+        service_ms = max(1.0, estimated_service_s * 1000.0)
+        structure_safe = (
+            structure_gain_ms / service_ms
+            >= max(0.0, float(MPLS_STRUCTURE_GAIN_PER_SERVICE_MIN or 0.0))
+            and slack_after_service_s
+            > max(0.0, float(MPLS_STRUCTURE_SAFE_MARGIN_MS or 0.0)) / 1000.0
+        )
+
+        if slack_after_service_s < -hopeless_grace_s:
+            rank = 5
+            name = "hopeless"
+        elif slack_after_service_s <= critical_slack_s:
+            rank = 0
+            name = "critical_feasible"
+        elif pinned_return:
+            rank = 1
+            name = "pinned_return_feasible"
+        elif structure_gain_ms > 0.0 and structure_safe:
+            rank = 2
+            name = "structure_beneficial_safe"
+        elif SchedulePolicy._req_cached_prefix_len(req) > 0:
+            rank = 3
+            name = "cache_local_normal"
+        else:
+            rank = 4
+            name = "normal"
+
+        eps_s = max(1e-6, float(MPLS_SLO_EPS_MS or 1.0) / 1000.0)
+        urgency = 1.0 / max(eps_s, slack_after_service_s)
+        return {
+            "rank": rank,
+            "name": name,
+            "slack_after_service_s": slack_after_service_s,
+            "slack_sort_s": slack_after_service_s if rank == 0 else 0.0,
+            "structure_gain_ms": structure_gain_ms,
+            "structure_sort": -structure_gain_ms if rank in {1, 2, 3} else 0.0,
+            "estimated_service_s": estimated_service_s,
+            "urgency": urgency,
+            "pinned_return": pinned_return,
+        }
+
+    @staticmethod
+    def _req_has_active_pin_hit(req: Req, now: float) -> bool:
+        node = getattr(req, "last_node", None)
+        root_guard = 0
+        while node is not None and root_guard < 256:
+            root_guard += 1
+            try:
+                if node.effective_priority(now) > 0.0:
+                    return True
+            except Exception:
+                return False
+            node = getattr(node, "parent", None)
+        return False
+
+    @staticmethod
+    def _req_cached_prefix_len(req: Req) -> int:
+        prefix_indices = getattr(req, "prefix_indices", None)
+        if prefix_indices is None:
+            return 0
+        try:
+            return len(prefix_indices)
+        except TypeError:
+            return 0
+
+    @staticmethod
+    def _cache_node_value_len(node) -> int:
+        value = getattr(node, "value", None)
+        if value is None:
+            return 0
+        try:
+            return len(value)
+        except TypeError:
+            return 0
+
+    @staticmethod
+    def _mpls_estimated_remaining_service_s(req: Req) -> float:
+        ms_per_token = max(0.0, float(MPLS_SLO_SERVICE_MS_PER_TOKEN or 0.0))
+        return (
+            SchedulePolicy._slo_cost_service_cost(req)
+            * ms_per_token
+            / 1000.0
+        )
+
+    @staticmethod
+    def _mpls_req_structure_gain_ms(
+        req: Req, ready_prefix_index: Dict[tuple, dict]
+    ) -> float:
+        direct_release_gain = SchedulePolicy._mpls_downstream_release_gain_ms(req)
+        bridge_info = SchedulePolicy._mpls_bridge_release_gain_info(
+            req, ready_prefix_index
+        )
+        return max(0.0, direct_release_gain) + max(
+            0.0, float(bridge_info.get("gain_ms") or 0.0)
+        )
+
+    @staticmethod
+    def _record_mpls_slo_selected_stats(
+        mpls_stats: Dict[str, float],
+        req: Req,
+        ready_prefix_index: Dict[tuple, dict],
+        now: float,
+    ) -> None:
+        tier = SchedulePolicy._mpls_slo_tier_for_req(req, ready_prefix_index, now)
+        mpls_stats[f"selected_slo_{tier['name']}_count"] += 1.0
+        if tier.get("pinned_return"):
+            mpls_stats["pinned_return_scheduled_count"] += 1.0
+        if tier["name"] == "hopeless":
+            hopeless_rids = mpls_stats.setdefault(
+                "__selected_slo_hopeless_rids", set()
+            )
+            if isinstance(hopeless_rids, set):
+                hopeless_rids.add(str(getattr(req, "rid", "")))
+        mpls_stats["selected_slo_slack_after_service_s_total"] += float(
+            tier["slack_after_service_s"]
+        )
+
+    @staticmethod
     def _get_mpls_dfs_overlay_priority(
         cur_node: TreeNode,
         node_to_score: Dict[TreeNode, float],
@@ -1156,6 +1472,10 @@ class SchedulePolicy:
         selected_count = max(1.0, float(self.mpls_stats.get("selected_count") or 0.0))
         calls = max(1.0, float(self.mpls_stats.get("calls") or 0.0))
         stats = dict(self.mpls_stats)
+        hopeless_rids = stats.pop("__selected_slo_hopeless_rids", set())
+        stats["selected_slo_hopeless_unique_request_count"] = (
+            float(len(hopeless_rids)) if isinstance(hopeless_rids, set) else 0.0
+        )
         stats["selected_prefix_len_avg"] = (
             float(stats.get("selected_prefix_len_total") or 0.0) / selected_count
         )
@@ -1229,6 +1549,64 @@ class SchedulePolicy:
         stats["selected_opportunity_accepted_rate"] = (
             float(stats.get("selected_opportunity_accepted_count_total") or 0.0)
             / selected_count
+        )
+        candidate_count = max(
+            1.0,
+            sum(
+                float(stats.get(f"slo_{name}_candidate_count_total") or 0.0)
+                for name in (
+                    "critical_feasible",
+                    "pinned_return_feasible",
+                    "structure_beneficial_safe",
+                    "cache_local_normal",
+                    "normal",
+                    "hopeless",
+                )
+            ),
+        )
+        for name in (
+            "critical_feasible",
+            "pinned_return_feasible",
+            "structure_beneficial_safe",
+            "cache_local_normal",
+            "normal",
+            "hopeless",
+        ):
+            stats[f"slo_{name}_candidate_rate"] = (
+                float(stats.get(f"slo_{name}_candidate_count_total") or 0.0)
+                / candidate_count
+            )
+            stats[f"selected_slo_{name}_rate"] = (
+                float(stats.get(f"selected_slo_{name}_count") or 0.0)
+                / selected_count
+            )
+        stats["slo_slack_after_service_s_avg"] = (
+            float(stats.get("slo_slack_after_service_s_total") or 0.0)
+            / candidate_count
+        )
+        stats["slo_estimated_service_s_avg"] = (
+            float(stats.get("slo_estimated_service_s_total") or 0.0)
+            / candidate_count
+        )
+        stats["selected_slo_slack_after_service_s_avg"] = (
+            float(stats.get("selected_slo_slack_after_service_s_total") or 0.0)
+            / selected_count
+        )
+        pinned_ready_count = max(
+            1.0, float(stats.get("pinned_return_ready_count") or 0.0)
+        )
+        stats["pinned_return_wait_ms_avg"] = (
+            float(stats.get("pinned_return_wait_ms_total") or 0.0)
+            / pinned_ready_count
+        )
+        stats["pinned_return_wait_ms_p95"] = float(
+            stats.get("pinned_return_wait_ms_max") or 0.0
+        )
+        stats["pin_ready_but_not_scheduled_ms_avg"] = stats["pinned_return_wait_ms_avg"]
+        stats["pin_ready_but_not_scheduled_ms_p95"] = stats["pinned_return_wait_ms_p95"]
+        stats["pin_reused_after_ready_rate"] = (
+            float(stats.get("pinned_return_scheduled_count") or 0.0)
+            / pinned_ready_count
         )
         SchedulePolicy._derive_mpls_gain_loss_diagnostics(
             stats, "bridge_candidate"

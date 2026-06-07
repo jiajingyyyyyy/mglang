@@ -161,6 +161,7 @@ class StructuredRequestHints:
     next_stage_prob: Optional[float] = None
     expected_tool_latency_ms: Optional[float] = None
     cache_pin_ttl_ms: Optional[float] = None
+    cache_pin_mode: Optional[str] = None
     motif_id: Optional[str] = None
     stage_id: Optional[str] = None
     static_prefix_len: Optional[float] = None
@@ -201,6 +202,7 @@ class StructuredRequestHints:
             "priority_class",
             "cache_affinity_key",
             "next_prefix_key",
+            "cache_pin_mode",
             "motif_id",
             "stage_id",
             "agent_type",
@@ -294,10 +296,24 @@ class StructuredRequestHints:
                 }
                 if ttl_ms is not None:
                     clean_entry["cache_pin_ttl_ms"] = max(0.0, float(ttl_ms))
-                for key in ("source", "level", "prefix_hash"):
+                for key in (
+                    "source",
+                    "level",
+                    "prefix_hash",
+                    "pin_dynamic",
+                    "kv_blocks",
+                    "saved_prefill_ms",
+                    "expected_queue_saving_ms",
+                    "structure_release_gain_ms",
+                    "reuse_probability",
+                ):
                     value = raw_entry.get(key)
                     if isinstance(value, str) and value:
                         clean_entry[key] = value
+                    elif isinstance(value, bool):
+                        clean_entry[key] = value
+                    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                        clean_entry[key] = float(value)
                 clean_ranges.append(clean_entry)
             if clean_ranges:
                 values["cache_pin_ranges"] = clean_ranges

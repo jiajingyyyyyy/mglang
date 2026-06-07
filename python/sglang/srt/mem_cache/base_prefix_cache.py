@@ -63,6 +63,7 @@ class InsertParams:
     cache_pin_expires_at: Optional[float] = None
     cache_hint_prefix_key: Optional[str] = None
     cache_pin_ranges: Optional[list[dict[str, Any]]] = None
+    cache_pin_metadata: Optional[dict[str, Any]] = None
 
 
 @dataclasses.dataclass
