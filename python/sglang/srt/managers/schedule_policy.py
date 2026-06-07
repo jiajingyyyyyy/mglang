@@ -1210,6 +1210,7 @@ class SchedulePolicy:
             pin_mode = str(getattr(node, "cache_pin_mode", "") or "")
             dynamic_guarded = pin_mode in {
                 "generic_layered_dynamic",
+                "structure_layered_dynamic",
                 "motif_layered_dynamic",
                 "request_soft_priority_guarded",
             } or bool(getattr(node, "cache_pin_dynamic", False))
