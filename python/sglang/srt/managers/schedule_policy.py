@@ -1988,6 +1988,9 @@ class SchedulePolicy:
 
     @staticmethod
     def _mpls_deadline_s(req: Req, now: float) -> float:
+        _disable_slo = os.environ.get("SGLANG_DISABLE_SLO_SCORE", "0") == "1"
+        if _disable_slo:
+            return float("inf")
         hint = getattr(req, "structured_hints", None)
         wait_entry = SchedulePolicy._mpls_arrival_s(req)
         latest_start_ms = None
