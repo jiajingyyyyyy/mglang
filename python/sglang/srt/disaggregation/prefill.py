@@ -471,6 +471,7 @@ class SchedulerDisaggregationPrefillMixin:
             if req.is_chunked <= 0:
                 if req.time_stats.prefill_finished_ts == 0.0:
                     req.time_stats.prefill_finished_ts = time.time()
+                    req.time_stats.prefill_finished_pc = time.perf_counter()
 
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)

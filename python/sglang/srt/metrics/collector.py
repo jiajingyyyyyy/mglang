@@ -84,6 +84,11 @@ class TimeStats:
     # maintain unit consistency with other timestamp fields tracked by the `ReqState` class.
     prefill_finished_ts: float = 0.0
 
+    # Timestamp when prefill phase finishes, obtained from `time.perf_counter()`.
+    # This is compatible with forward_entry_time and completion_time for
+    # computing prefill/decode duration breakdowns.
+    prefill_finished_pc: float = 0.0
+
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
 
@@ -100,6 +105,16 @@ class TimeStats:
     def get_prefill_finished_ts(self) -> Optional[float]:
         if self.prefill_finished_ts > 0.0:
             return self.prefill_finished_ts
+        return None
+
+    def get_prefill_duration_ms(self) -> Optional[float]:
+        if self.prefill_finished_pc > 0.0 and self.forward_entry_time > 0.0:
+            return (self.prefill_finished_pc - self.forward_entry_time) * 1000.0
+        return None
+
+    def get_decode_duration_ms(self) -> Optional[float]:
+        if self.prefill_finished_pc > 0.0 and self.completion_time > 0.0:
+            return (self.completion_time - self.prefill_finished_pc) * 1000.0
         return None
 
     def convert_to_duration(self) -> str:

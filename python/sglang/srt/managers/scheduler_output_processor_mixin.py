@@ -169,6 +169,7 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     if req.time_stats.prefill_finished_ts == 0.0:
                         req.time_stats.prefill_finished_ts = time.time()
+                        req.time_stats.prefill_finished_pc = time.perf_counter()
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
@@ -922,6 +923,8 @@ class SchedulerOutputProcessorMixin:
         prefill_launch_delays = []
         prefill_launch_latencies = []
         prefill_finished_timestamps = []
+        prefill_durations = []
+        decode_durations = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -1037,6 +1040,8 @@ class SchedulerOutputProcessorMixin:
                 prefill_finished_timestamps.append(
                     req.time_stats.get_prefill_finished_ts()
                 )
+                prefill_durations.append(req.time_stats.get_prefill_duration_ms())
+                decode_durations.append(req.time_stats.get_decode_duration_ms())
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -1149,6 +1154,8 @@ class SchedulerOutputProcessorMixin:
                     prefill_launch_delay=prefill_launch_delays,
                     prefill_launch_latency=prefill_launch_latencies,
                     prefill_finished_ts=prefill_finished_timestamps,
+                    prefill_duration_ms=prefill_durations,
+                    decode_duration_ms=decode_durations,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,
                     decode_ids=decode_ids_list,
@@ -1198,6 +1205,8 @@ class SchedulerOutputProcessorMixin:
         prefill_launch_delays = []
         prefill_launch_latencies = []
         prefill_finished_timestamps = []
+        prefill_durations = []
+        decode_durations = []
         retraction_counts = []
         for req in reqs:
             if req.finished():

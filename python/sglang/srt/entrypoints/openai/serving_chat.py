@@ -990,13 +990,21 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
+        # --- pass through timing instrumentation in metadata ---
+        meta = ret[0]["meta_info"]
+        metadata: dict[str, Any] = {"weight_version": meta.get("weight_version")}
+        for timing_key in ("queue_time", "prefill_launch_delay", "prefill_launch_latency",
+                           "prefill_finished_ts", "prefill_duration_ms", "decode_duration_ms"):
+            if timing_key in meta:
+                metadata[timing_key] = meta[timing_key]
+
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=metadata,
             sglext=response_sglext,
         )
 

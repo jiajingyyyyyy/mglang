@@ -1511,6 +1511,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self._add_metric_if_present(
                     recv_obj, "prefill_finished_ts", meta_info, i
                 )
+                self._add_metric_if_present(
+                    recv_obj, "prefill_duration_ms", meta_info, i
+                )
+                self._add_metric_if_present(
+                    recv_obj, "decode_duration_ms", meta_info, i
+                )
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(

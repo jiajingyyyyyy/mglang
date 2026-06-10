@@ -102,7 +102,6 @@ class RequestTimingMetricsMixin:
     # This marks when the prefill computation finishes.
     prefill_finished_ts: Optional[List[Optional[float]]]
 
-
 @dataclass
 class SpeculativeDecodingMetricsMixin:
     """
@@ -1330,6 +1329,10 @@ class BatchTokenIDOutput(
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
+    # Prefill/decode duration in milliseconds (direct measurement, not regression).
+    prefill_duration_ms: Optional[List[Optional[float]]] = None
+    decode_duration_ms: Optional[List[Optional[float]]] = None
+
 
 @dataclass
 class BatchMultimodalDecodeReq(BaseBatchReq):
@@ -1421,6 +1424,10 @@ class BatchStrOutput(
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
+    # Prefill/decode duration in milliseconds (direct measurement, not regression).
+    prefill_duration_ms: Optional[List[Optional[float]]] = None
+    decode_duration_ms: Optional[List[Optional[float]]] = None
+
 
 @dataclass
 class BatchMultimodalOutput(BaseBatchReq):
@@ -1466,6 +1473,10 @@ class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
     retraction_counts: List[int]
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+
+    # Prefill/decode duration in milliseconds (direct measurement, not regression).
+    prefill_duration_ms: Optional[List[Optional[float]]] = None
+    decode_duration_ms: Optional[List[Optional[float]]] = None
 
 
 @dataclass
