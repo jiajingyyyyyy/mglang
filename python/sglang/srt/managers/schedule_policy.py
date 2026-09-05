@@ -38,8 +38,6 @@ SLO_BOOST_MOTIF_LAG_TARGET_MS = float(
 SLO_BOOST_MAX_MULTIPLIER = float(
     os.environ.get("SGLANG_SLO_BOOST_MAX_MULTIPLIER", "4.0")
 )
-SLO_PREFIX_MIX_DFS_SLOTS = int(os.environ.get("SGLANG_SLO_PREFIX_MIX_DFS_SLOTS", "3"))
-SLO_PREFIX_MIX_SLO_SLOTS = int(os.environ.get("SGLANG_SLO_PREFIX_MIX_SLO_SLOTS", "1"))
 SLO_COST_PREFIX_DECODE_WEIGHT = float(
     os.environ.get("SGLANG_SLO_COST_PREFIX_DECODE_WEIGHT", "0.0")
 )
@@ -129,6 +127,9 @@ MPLS_IMMINENT_UNLOCK_WEIGHT = float(
     os.environ.get("SGLANG_MPLS_IMMINENT_UNLOCK_WEIGHT", "0.0")
 )
 MPLS_SLO_TIERING = get_bool_env_var("SGLANG_MPLS_SLO_TIERING", "true")
+MPLS_PINNED_RETURN_TIERING = get_bool_env_var(
+    "SGLANG_MPLS_PINNED_RETURN_TIERING", "true"
+)
 MPLS_SLO_CRITICAL_SLACK_MS = float(
     os.environ.get("SGLANG_MPLS_SLO_CRITICAL_SLACK_MS", "500")
 )
@@ -226,7 +227,6 @@ class CacheAwarePolicy(Enum):
     SLO_MARGINAL_PREFIX_DFS = "slo-marginal-prefix-dfs"  # SLO-prefix DFS with weak marginal prefill cost
     SLO_COST_PREFIX_DFS = "slo-cost-prefix-dfs"  # prefix reuse weighted by SLO urgency/cost
     SEMANTIC_SLO_COST_DFS = "semantic-slo-cost-dfs"  # motif semantic overlay over SLO/cost prefix DFS
-    SLO_PREFIX_MIXED_DFS = "slo-prefix-mixed-dfs"  # bounded SLO slice over DFS
     MPLS = "mpls"  # deadline-guarded motif prefix lease scheduling
     MPLS_SLO = "mpls_slo"  # MPLS alias with SLO tiering enabled by default
     STRUCTURE_INFORMED_SLO = "structure-informed-slo"  # motif-progress SLO feasibility over MPLS
@@ -267,7 +267,6 @@ class SchedulePolicy:
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
-        self.slo_prefix_mixed_slo_order_rids = []
         self.mpls_stats = defaultdict(float)
 
     def calc_priority(
@@ -314,8 +313,6 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_slo_cost_prefix_dfs(
                     waiting_queue, self.tree_cache, semantic_overlay=True
                 )
-            elif policy == CacheAwarePolicy.SLO_PREFIX_MIXED_DFS:
-                self._sort_by_slo_prefix_mixed_dfs(waiting_queue, self.tree_cache)
             elif policy == CacheAwarePolicy.MPLS:
                 SchedulePolicy._sort_by_mpls(
                     waiting_queue,
@@ -1256,7 +1253,10 @@ class SchedulePolicy:
         structure_gain_ms = SchedulePolicy._mpls_req_structure_gain_ms(
             req, ready_prefix_index
         )
-        pinned_return = SchedulePolicy._req_has_active_pin_hit(req, now)
+        pinned_return = (
+            MPLS_PINNED_RETURN_TIERING
+            and SchedulePolicy._req_has_active_pin_hit(req, now)
+        )
         service_ms = max(1.0, estimated_service_s * 1000.0)
         structure_safe = (
             structure_gain_ms / service_ms
@@ -1842,12 +1842,6 @@ class SchedulePolicy:
         if downstream <= 0.0 and depth <= 0.0:
             return 1.0
         return max(0.25, min(4.0, 1.0 + 0.25 * downstream + 0.15 * depth))
-
-    @staticmethod
-    def _mpls_bridge_release_gain_ms(req: Req, ready_prefix_index: Dict[tuple, dict]) -> float:
-        return SchedulePolicy._mpls_bridge_release_gain_info(
-            req, ready_prefix_index
-        )["gain_ms"]
 
     @staticmethod
     def _mpls_bridge_release_gain_info(
@@ -3032,80 +3026,6 @@ class SchedulePolicy:
             )
         )
         q.extend(reqs)
-
-    def _sort_by_slo_prefix_mixed_dfs(
-        self, waiting_queue: List[Req], tree_cache: BasePrefixCache
-    ) -> None:
-        """Keep DFS as the main lane and cache a bounded SLO-prefix slice order.
-
-        The scheduler uses the cached SLO-prefix order at prefill batch
-        construction time, so the split applies to the current serving batch
-        instead of globally interleaving the entire waiting queue.
-        """
-        self.slo_prefix_mixed_slo_order_rids = []
-        if len(waiting_queue) <= 1:
-            return
-
-        dfs_order = list(waiting_queue)
-        slo_order = list(waiting_queue)
-        SchedulePolicy._sort_by_dfs_weight(dfs_order, tree_cache)
-        SchedulePolicy._sort_by_slo_prefix_dfs(slo_order, tree_cache)
-        self.slo_prefix_mixed_slo_order_rids = [req.rid for req in slo_order]
-        waiting_queue[:] = dfs_order
-
-    def build_slo_prefix_mixed_batch_order(
-        self, waiting_queue: List[Req]
-    ) -> Optional[List[Req]]:
-        """Return a per-batch DFS/SLO candidate order for mixed scheduling."""
-
-        policy_value = getattr(getattr(self, "policy", None), "value", None)
-        if policy_value != "slo-prefix-mixed-dfs" or len(waiting_queue) <= 1:
-            return None
-
-        dfs_slots = max(1, SLO_PREFIX_MIX_DFS_SLOTS)
-        slo_slots = max(0, SLO_PREFIX_MIX_SLO_SLOTS)
-        if slo_slots <= 0 or not self.slo_prefix_mixed_slo_order_rids:
-            return None
-
-        rid_to_req = {req.rid: req for req in waiting_queue}
-        slo_order = [
-            rid_to_req[rid]
-            for rid in self.slo_prefix_mixed_slo_order_rids
-            if rid in rid_to_req
-        ]
-        pattern = ["dfs"] * dfs_slots + ["slo"] * slo_slots
-        selected = set()
-        mixed_order: List[Req] = []
-        dfs_idx = 0
-        slo_idx = 0
-
-        def take_from(order: List[Req], start: int) -> tuple[Optional[Req], int]:
-            idx = start
-            while idx < len(order):
-                req = order[idx]
-                idx += 1
-                if req.rid not in selected:
-                    return req, idx
-            return None, idx
-
-        while len(mixed_order) < len(waiting_queue):
-            for lane in pattern:
-                if len(mixed_order) >= len(waiting_queue):
-                    break
-                if lane == "slo":
-                    req, slo_idx = take_from(slo_order, slo_idx)
-                    if req is None:
-                        req, dfs_idx = take_from(waiting_queue, dfs_idx)
-                else:
-                    req, dfs_idx = take_from(waiting_queue, dfs_idx)
-                    if req is None:
-                        req, slo_idx = take_from(slo_order, slo_idx)
-                if req is None:
-                    continue
-                selected.add(req.rid)
-                mixed_order.append(req)
-
-        return mixed_order
 
 
 class AddReqResult(Enum):

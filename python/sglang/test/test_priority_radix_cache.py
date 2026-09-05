@@ -97,6 +97,9 @@ class PriorityRadixCacheTest(unittest.TestCase):
                         "priority": 7.0,
                         "cache_pin_ttl_ms": 1000.0,
                         "source": "reuse",
+                        "release_after_hits": 1,
+                        "release_consumer_key": "successor",
+                        "lease_key": "predecessor->successor",
                     }
                 ],
             }
@@ -106,6 +109,138 @@ class PriorityRadixCacheTest(unittest.TestCase):
         self.assertEqual(hints.cache_pin_ranges[0]["start"], 1)
         self.assertEqual(hints.cache_pin_ranges[0]["end"], 3)
         self.assertEqual(hints.cache_pin_ranges[0]["source"], "reuse")
+        self.assertEqual(hints.cache_pin_ranges[0]["release_after_hits"], 1.0)
+        self.assertEqual(hints.cache_pin_ranges[0]["release_consumer_key"], "successor")
+        self.assertEqual(
+            hints.cache_pin_ranges[0]["lease_key"], "predecessor->successor"
+        )
+
+    def test_cross_request_reuse_releases_range_pin(self) -> None:
+        class FakeReq:
+            rid = "successor"
+            cache_hint_consumer_key = "successor"
+
+        cache, _allocator = self.make_cache()
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                cache_pin_ranges=[
+                    {
+                        "start": 0,
+                        "end": 4,
+                        "priority": 5.0,
+                        "cache_pin_ttl_ms": 10000.0,
+                        "source": "release",
+                        "release_after_hits": 1,
+                        "release_consumer_key": "successor",
+                        "lease_key": "predecessor->successor",
+                    }
+                ],
+                cache_pin_metadata={"pin_mode": "layered_static"},
+            )
+        )
+
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 3, 4, 9]), req=FakeReq())
+        )
+
+        self.assertEqual(match.last_device_node.effective_priority(), 0.0)
+        stats = cache.priority_eviction_stats()
+        self.assertEqual(stats["pin_released_after_reuse_blocks"], 4.0)
+        self.assertEqual(stats["pin_release_after_reuse_events"], 1.0)
+
+    def test_non_consumer_and_read_only_matches_do_not_release_range_pin(self) -> None:
+        class ParentReq:
+            cache_hint_consumer_key = "predecessor"
+
+        class UnrelatedReq:
+            cache_hint_consumer_key = "unrelated"
+
+        cache, _allocator = self.make_cache()
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                cache_pin_ranges=[
+                    {
+                        "start": 0,
+                        "end": 4,
+                        "priority": 5.0,
+                        "cache_pin_ttl_ms": 10000.0,
+                        "source": "release",
+                        "release_after_hits": 1,
+                        "release_consumer_key": "successor",
+                        "lease_key": "predecessor->successor",
+                    }
+                ],
+                cache_pin_metadata={"pin_mode": "layered_static"},
+            )
+        )
+
+        cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3, 4, 9])))
+        cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 3, 4, 9]), req=UnrelatedReq())
+        )
+        parent_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 3, 4, 9]), req=ParentReq())
+        )
+
+        self.assertGreater(parent_match.last_device_node.effective_priority(), 0.0)
+        stats = cache.priority_eviction_stats()
+        self.assertEqual(stats["pin_released_after_reuse_blocks"], 0.0)
+
+    def test_shared_prefix_keeps_other_dependency_lease_active(self) -> None:
+        class FirstChild:
+            rid = "child-a"
+            cache_hint_consumer_key = "child-a"
+
+        class SecondChild:
+            rid = "child-b"
+            cache_hint_consumer_key = "child-b"
+
+        cache, _allocator = self.make_cache()
+        for parent, child in (("parent-a", "child-a"), ("parent-b", "child-b")):
+            cache.insert(
+                InsertParams(
+                    key=RadixKey([1, 2, 3, 4]),
+                    cache_pin_ranges=[
+                        {
+                            "start": 0,
+                            "end": 4,
+                            "priority": 5.0,
+                            "cache_pin_ttl_ms": 10000.0,
+                            "source": "release",
+                            "release_after_hits": 1,
+                            "release_consumer_key": child,
+                            "lease_key": f"{parent}->{child}",
+                        }
+                    ],
+                    cache_pin_metadata={"pin_mode": "layered_static"},
+                )
+            )
+
+        first_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 3, 4, 9]), req=FirstChild())
+        )
+        self.assertGreater(first_match.last_device_node.effective_priority(), 0.0)
+        first_stats = cache.priority_eviction_stats()
+        self.assertEqual(first_stats["pin_lease_consumed_count"], 1.0)
+        self.assertEqual(first_stats["pin_unique_lease_created_count"], 2.0)
+        self.assertEqual(first_stats["pin_unique_lease_consumed_count"], 1.0)
+        self.assertEqual(first_stats["pin_unique_lease_hit_rate"], 0.5)
+        self.assertEqual(first_stats["pin_lease_active_count"], 1.0)
+        self.assertEqual(first_stats["pin_released_after_reuse_blocks"], 0.0)
+
+        second_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 3, 4, 9]), req=SecondChild())
+        )
+        self.assertEqual(second_match.last_device_node.effective_priority(), 0.0)
+        final_stats = cache.priority_eviction_stats()
+        self.assertEqual(final_stats["pin_lease_consumed_count"], 2.0)
+        self.assertEqual(final_stats["pin_unique_lease_created_count"], 2.0)
+        self.assertEqual(final_stats["pin_unique_lease_consumed_count"], 2.0)
+        self.assertEqual(final_stats["pin_unique_lease_hit_rate"], 1.0)
+        self.assertEqual(final_stats["pin_lease_active_count"], 0.0)
+        self.assertEqual(final_stats["pin_released_after_reuse_blocks"], 4.0)
 
     def test_cache_pin_ranges_protect_only_selected_tokens(self) -> None:
         cache, _allocator = self.make_cache()

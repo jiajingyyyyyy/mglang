@@ -161,6 +161,7 @@ class StructuredRequestHints:
     expected_tool_latency_ms: Optional[float] = None
     cache_pin_ttl_ms: Optional[float] = None
     cache_pin_mode: Optional[str] = None
+    cache_consumer_key: Optional[str] = None
     motif_id: Optional[str] = None
     stage_id: Optional[str] = None
     static_prefix_len: Optional[float] = None
@@ -202,6 +203,7 @@ class StructuredRequestHints:
             "cache_affinity_key",
             "next_prefix_key",
             "cache_pin_mode",
+            "cache_consumer_key",
             "motif_id",
             "stage_id",
             "agent_type",
@@ -305,6 +307,9 @@ class StructuredRequestHints:
                     "expected_queue_saving_ms",
                     "structure_release_gain_ms",
                     "reuse_probability",
+                    "release_after_hits",
+                    "release_consumer_key",
+                    "lease_key",
                 ):
                     value = raw_entry.get(key)
                     if isinstance(value, str) and value:

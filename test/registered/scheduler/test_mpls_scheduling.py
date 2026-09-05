@@ -232,6 +232,25 @@ class TestMplsScheduling(unittest.TestCase):
         stats = policy.get_mpls_stats()
         self.assertGreater(stats["slo_hopeless_candidate_rate"], 0.0)
 
+    def test_mpls_can_disable_pinned_return_tier_without_disabling_slo_tiers(self):
+        req = _req(
+            "pinned",
+            [1, 10],
+            ladder=[{"level": "stage", "prefix_hash": "pinned", "prefix_len": 10}],
+            deadline_ms=10_000,
+        )
+
+        with patch.object(
+            SchedulePolicy, "_req_has_active_pin_hit", return_value=True
+        ), patch(
+            "sglang.srt.managers.schedule_policy.MPLS_PINNED_RETURN_TIERING",
+            False,
+        ):
+            tier = SchedulePolicy._mpls_slo_tier_for_req(req, {}, 1.05)
+
+        self.assertFalse(tier["pinned_return"])
+        self.assertEqual(tier["name"], "normal")
+
     def test_mpls_internal_deadline_overrides_generic_latest_start(self):
         urgent_ladder = [
             {"level": "stage", "prefix_hash": "urgent", "prefix_len": 10}

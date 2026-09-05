@@ -623,6 +623,11 @@ class Req(ReqDllmMixin):
         self.cache_hint_pin_mode = (
             getattr(structured_hints, "cache_pin_mode", None) if structured_hints else None
         )
+        self.cache_hint_consumer_key = (
+            getattr(structured_hints, "cache_consumer_key", None)
+            if structured_hints
+            else None
+        )
         self.cache_hint_motif_id = (
             getattr(structured_hints, "motif_id", None) if structured_hints else None
         )
@@ -940,6 +945,9 @@ class Req(ReqDllmMixin):
                 "expected_queue_saving_ms",
                 "structure_release_gain_ms",
                 "reuse_probability",
+                "release_after_hits",
+                "release_consumer_key",
+                "lease_key",
             ):
                 value = item.get(key)
                 if isinstance(value, str) and value:
@@ -1042,7 +1050,7 @@ class Req(ReqDllmMixin):
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                    req=self if tree_cache.supports_mamba() else None,
+                    req=self,
                     cow_mamba=tree_cache.supports_mamba(),
                 )
             )

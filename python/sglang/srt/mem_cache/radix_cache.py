@@ -145,6 +145,8 @@ class TreeNode:
         self.cache_pin_expected_queue_saving_ms: float = 0.0
         self.cache_pin_dynamic: bool = False
         self.cache_pin_forced_unpin = False
+        self.cache_pin_released_after_reuse = False
+        self.cache_pin_leases: dict[str, dict[str, Any]] = {}
         self.cache_hit_after_pin = 0
 
         self.id = TreeNode.counter if id is None else id
@@ -159,11 +161,23 @@ class TreeNode:
         return self.host_value is not None
 
     def effective_priority(self, now: Optional[float] = None) -> float:
+        now = time.monotonic() if now is None else now
+        lease_priority = max(
+            (
+                max(0.0, float(lease.get("priority") or 0.0))
+                for lease in self.cache_pin_leases.values()
+                if int(lease.get("remaining_hits") or 0) > 0
+                and (
+                    lease.get("expires_at") is None or now <= float(lease["expires_at"])
+                )
+            ),
+            default=0.0,
+        )
+        legacy_priority = max(0.0, float(self.priority or 0.0))
         if self.cache_pin_expires_at is not None:
-            now = time.monotonic() if now is None else now
             if now > self.cache_pin_expires_at:
-                return 0.0
-        return max(0.0, float(self.priority or 0.0))
+                legacy_priority = 0.0
+        return max(legacy_priority, lease_priority)
 
     def protect_host(self):
         """Protect the host value from eviction."""
@@ -393,6 +407,16 @@ class RadixCache(BasePrefixCache):
         self.reuse_after_pin_events = 0
         self.reuse_after_pin_tokens = 0
         self.reuse_after_pin_node_hits = 0
+        self.pin_released_after_reuse_blocks = 0
+        self.pin_release_after_reuse_events = 0
+        self.pin_lease_created_count = 0
+        self.pin_lease_refreshed_count = 0
+        self.pin_lease_consumed_count = 0
+        # Radix-node splits copy lease metadata, so node-level counters do not
+        # equal the number of logical retention hints.
+        self.pin_unique_lease_created_keys: set[str] = set()
+        self.pin_unique_lease_consumed_keys: set[str] = set()
+        self.pin_unique_lease_expires_at: dict[str, Optional[float]] = {}
         self.priority_protected_blocks_by_source = defaultdict(float)
         self.priority_evicted_blocks_by_source = defaultdict(float)
         self.protected_blocks_by_agent_type = defaultdict(float)
@@ -489,8 +513,11 @@ class RadixCache(BasePrefixCache):
         pinned_node_hits = 0
         agent_hits = defaultdict(float)
         saved_prefill_ms = 0.0
+        release_candidates = []
+        consumer_key = str(getattr(params.req, "cache_hint_consumer_key", None) or "")
+        now = time.monotonic()
         for matched_node in matched_nodes:
-            if matched_node.effective_priority() > 0:
+            if matched_node.effective_priority(now) > 0:
                 pinned_node_hits += 1
                 node_tokens = self._node_value_len(matched_node)
                 pinned_token_hits += node_tokens
@@ -499,6 +526,21 @@ class RadixCache(BasePrefixCache):
                     getattr(matched_node, "cache_pin_saved_prefill_ms", 0.0) or 0.0
                 )
                 matched_node.cache_hit_after_pin += 1
+                matching_leases = [
+                    lease_key
+                    for lease_key, lease in matched_node.cache_pin_leases.items()
+                    if consumer_key
+                    and consumer_key == str(lease.get("consumer_key") or "")
+                    and int(lease.get("remaining_hits") or 0) > 0
+                    and (
+                        lease.get("expires_at") is None
+                        or now <= float(lease["expires_at"])
+                    )
+                ]
+                if matching_leases:
+                    release_candidates.append(
+                        (matched_node, node_tokens, matching_leases)
+                    )
         if last_node is not self.root_node and last_node.effective_priority() > 0:
             self.reuse_after_pin_count += 1
         if pinned_token_hits > 0:
@@ -510,6 +552,23 @@ class RadixCache(BasePrefixCache):
             self.estimated_saved_prefill_ms += saved_prefill_ms
             for agent_type, token_count in agent_hits.items():
                 self.reuse_tokens_by_agent_type[agent_type] += token_count
+        released_blocks = 0
+        for matched_node, node_tokens, matching_leases in release_candidates:
+            priority_before = matched_node.effective_priority(now)
+            for lease_key in matching_leases:
+                lease = matched_node.cache_pin_leases[lease_key]
+                lease["remaining_hits"] = max(
+                    0, int(lease.get("remaining_hits") or 0) - 1
+                )
+                if lease["remaining_hits"] == 0:
+                    self.pin_lease_consumed_count += 1
+                    self.pin_unique_lease_consumed_keys.add(lease_key)
+            if priority_before > 0 and matched_node.effective_priority(now) <= 0:
+                matched_node.cache_pin_released_after_reuse = True
+                released_blocks += node_tokens
+        if released_blocks > 0:
+            self.pin_released_after_reuse_blocks += released_blocks
+            self.pin_release_after_reuse_events += 1
         if value:
             value = torch.cat(value)
         else:
@@ -742,7 +801,7 @@ class RadixCache(BasePrefixCache):
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
-            if x.priority > 0:
+            if x.priority > 0 or x.cache_pin_leases:
                 source = str(getattr(x, "cache_pin_source", None) or "request")
                 node_tokens = len(x.value)
                 pin_mode = str(getattr(x, "cache_pin_mode", None) or source)
@@ -756,11 +815,12 @@ class RadixCache(BasePrefixCache):
                 self.eviction_victim_stage_id[stage_id] += node_tokens
                 if x.effective_priority() <= 0:
                     self.priority_expired_blocks += node_tokens
-                    reason = (
-                        "forced_unpin"
-                        if getattr(x, "cache_pin_forced_unpin", False)
-                        else "ttl_expired"
-                    )
+                    if getattr(x, "cache_pin_released_after_reuse", False):
+                        reason = "reuse_consumed"
+                    elif getattr(x, "cache_pin_forced_unpin", False):
+                        reason = "forced_unpin"
+                    else:
+                        reason = "ttl_expired"
                     self.eviction_reason[reason] += node_tokens
                 else:
                     self.priority_evicted_blocks += node_tokens
@@ -846,6 +906,43 @@ class RadixCache(BasePrefixCache):
             if self.free_blocks_ratio_samples
             else self._free_blocks_ratio()
         )
+        now = time.monotonic()
+        leases = [
+            lease
+            for node in self._iter_tree_nodes(self.root_node)
+            for lease in node.cache_pin_leases.values()
+        ]
+        active_leases = sum(
+            1
+            for lease in leases
+            if int(lease.get("remaining_hits") or 0) > 0
+            and (
+                lease.get("expires_at") is None
+                or now <= float(lease["expires_at"])
+            )
+        )
+        expired_leases = sum(
+            1
+            for lease in leases
+            if int(lease.get("remaining_hits") or 0) > 0
+            and lease.get("expires_at") is not None
+            and now > float(lease["expires_at"])
+        )
+        unique_created = len(self.pin_unique_lease_created_keys)
+        unique_consumed = len(self.pin_unique_lease_consumed_keys)
+        unique_active = sum(
+            1
+            for lease_key, expires_at in self.pin_unique_lease_expires_at.items()
+            if lease_key not in self.pin_unique_lease_consumed_keys
+            and (expires_at is None or now <= expires_at)
+        )
+        unique_expired = sum(
+            1
+            for lease_key, expires_at in self.pin_unique_lease_expires_at.items()
+            if lease_key not in self.pin_unique_lease_consumed_keys
+            and expires_at is not None
+            and now > expires_at
+        )
         return {
             "pinned_blocks_total": float(self.pinned_blocks_total),
             "pinned_blocks_evicted": float(self.pinned_blocks_evicted),
@@ -891,6 +988,26 @@ class RadixCache(BasePrefixCache):
             "reuse_after_pin_events": float(self.reuse_after_pin_events),
             "reuse_after_pin_tokens": float(self.reuse_after_pin_tokens),
             "reuse_after_pin_node_hits": float(self.reuse_after_pin_node_hits),
+            "pin_released_after_reuse_blocks": float(
+                self.pin_released_after_reuse_blocks
+            ),
+            "pin_release_after_reuse_events": float(
+                self.pin_release_after_reuse_events
+            ),
+            "pin_lease_created_count": float(self.pin_lease_created_count),
+            "pin_lease_refreshed_count": float(self.pin_lease_refreshed_count),
+            "pin_lease_consumed_count": float(self.pin_lease_consumed_count),
+            "pin_lease_active_count": float(active_leases),
+            "pin_lease_expired_count": float(expired_leases),
+            "pin_unique_lease_created_count": float(unique_created),
+            "pin_unique_lease_consumed_count": float(unique_consumed),
+            "pin_unique_lease_active_count": float(unique_active),
+            "pin_unique_lease_expired_count": float(unique_expired),
+            "pin_unique_lease_hit_rate": (
+                float(unique_consumed) / float(unique_created)
+                if unique_created > 0
+                else 0.0
+            ),
             "reuse_after_pin_token_rate": (
                 float(self.reuse_after_pin_tokens) / total_protected
                 if total_protected > 0.0
@@ -1098,6 +1215,11 @@ class RadixCache(BasePrefixCache):
         new_node.cache_hint_motif_id = child.cache_hint_motif_id
         new_node.cache_hint_stage_id = child.cache_hint_stage_id
         new_node.cache_pin_forced_unpin = child.cache_pin_forced_unpin
+        new_node.cache_pin_released_after_reuse = child.cache_pin_released_after_reuse
+        new_node.cache_pin_leases = {
+            key: dict(lease) for key, lease in child.cache_pin_leases.items()
+        }
+        self.pin_lease_created_count += len(new_node.cache_pin_leases)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -1126,6 +1248,49 @@ class RadixCache(BasePrefixCache):
     ):
         priority = max(0.0, float(priority or 0.0))
         if priority <= 0.0:
+            return
+        metadata = cache_pin_metadata or {}
+        lease_key = str(metadata.get("lease_key") or "")
+        consumer_key = str(metadata.get("release_consumer_key") or "")
+        release_after_hits = max(0, int(metadata.get("release_after_hits") or 0))
+        if lease_key and consumer_key and release_after_hits > 0:
+            existing_active = node.effective_priority() > 0.0
+            if lease_key in node.cache_pin_leases:
+                self.pin_lease_refreshed_count += 1
+            else:
+                self.pin_lease_created_count += 1
+            self.pin_unique_lease_created_keys.add(lease_key)
+            if lease_key not in self.pin_unique_lease_expires_at:
+                self.pin_unique_lease_expires_at[lease_key] = cache_pin_expires_at
+            else:
+                previous_expiry = self.pin_unique_lease_expires_at[lease_key]
+                self.pin_unique_lease_expires_at[lease_key] = (
+                    None
+                    if previous_expiry is None or cache_pin_expires_at is None
+                    else max(previous_expiry, cache_pin_expires_at)
+                )
+            node.cache_pin_leases[lease_key] = {
+                "priority": priority,
+                "expires_at": cache_pin_expires_at,
+                "consumer_key": consumer_key,
+                "remaining_hits": release_after_hits,
+                "source": cache_pin_source,
+            }
+            if not existing_active and node.effective_priority() > 0.0:
+                node_tokens = self._node_value_len(node)
+                self.priority_protected_blocks += node_tokens
+                self.priority_protected_blocks_by_source[
+                    cache_pin_source
+                ] += node_tokens
+                self.protected_blocks_by_agent_type[
+                    self._agent_bucket_from_metadata(cache_pin_metadata)
+                ] += node_tokens
+                self.pinned_blocks_total += node_tokens
+            node.cache_pin_utility = max(node.cache_pin_utility, priority)
+            node.cache_hint_prefix_key = cache_hint_prefix_key
+            node.cache_pin_source = cache_pin_source
+            node.cache_pin_released_after_reuse = False
+            self._apply_cache_pin_metadata(node, cache_pin_metadata)
             return
         existing_active = node.effective_priority() > 0.0
         if not existing_active or priority >= node.effective_priority():
@@ -1246,6 +1411,11 @@ class RadixCache(BasePrefixCache):
                     "saved_prefill_ms": float(item.get("saved_prefill_ms") or 0.0),
                     "expected_queue_saving_ms": float(item.get("expected_queue_saving_ms") or 0.0),
                     "structure_release_gain_ms": float(item.get("structure_release_gain_ms") or 0.0),
+                    "release_after_hits": max(
+                        0, int(item.get("release_after_hits") or 0)
+                    ),
+                    "release_consumer_key": str(item.get("release_consumer_key") or ""),
+                    "lease_key": str(item.get("lease_key") or ""),
                 }
             )
         return cleaned
@@ -1316,6 +1486,9 @@ class RadixCache(BasePrefixCache):
                     "saved_prefill_ms": best.get("saved_prefill_ms", 0.0),
                     "expected_queue_saving_ms": best.get("expected_queue_saving_ms", 0.0),
                     "structure_release_gain_ms": best.get("structure_release_gain_ms", 0.0),
+                    "release_after_hits": best.get("release_after_hits", 0),
+                    "release_consumer_key": best.get("release_consumer_key", ""),
+                    "lease_key": best.get("lease_key", ""),
                     "utility": best["priority"],
                 },
             )
